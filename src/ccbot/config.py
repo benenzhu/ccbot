@@ -1,9 +1,13 @@
 """Application configuration — reads env vars and exposes a singleton.
 
-Loads TELEGRAM_BOT_TOKEN, ALLOWED_USERS, tmux/Claude paths, and
-monitoring intervals from environment variables (with .env support).
+Loads platform selection (CCBOT_PLATFORM), credentials, tmux/Claude paths,
+and monitoring intervals from environment variables (with .env support).
 .env loading priority: local .env (cwd) > $CCBOT_DIR/.env (default ~/.ccbot).
 The module-level `config` instance is imported by nearly every other module.
+
+Supported platforms:
+  - telegram (default): requires TELEGRAM_BOT_TOKEN, ALLOWED_USERS
+  - feishu: requires FEISHU_APP_ID, FEISHU_APP_SECRET, ALLOWED_USERS
 
 Key class: Config (singleton instantiated as `config`).
 """
@@ -11,6 +15,7 @@ Key class: Config (singleton instantiated as `config`).
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 
@@ -19,7 +24,16 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
-SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
+SENSITIVE_ENV_VARS = {
+    "TELEGRAM_BOT_TOKEN",
+    "ALLOWED_USERS",
+    "OPENAI_API_KEY",
+    "FEISHU_APP_SECRET",
+    "FEISHU_ENCRYPT_KEY",
+    "FEISHU_VERIFICATION_TOKEN",
+}
+
+PlatformType = Literal["telegram", "feishu"]
 
 
 class Config:
@@ -40,22 +54,53 @@ class Config:
             load_dotenv(global_env)
             logger.debug("Loaded env from %s", global_env)
 
-        self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN") or ""
-        if not self.telegram_bot_token:
-            raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+        # Platform selection: "telegram" (default) or "feishu"
+        platform_str = os.getenv("CCBOT_PLATFORM", "telegram").lower()
+        if platform_str not in ("telegram", "feishu"):
+            raise ValueError(
+                f"CCBOT_PLATFORM must be 'telegram' or 'feishu', got '{platform_str}'"
+            )
+        self.platform: PlatformType = platform_str  # type: ignore[assignment]
 
+        # --- Platform-specific credentials ---
+        if self.platform == "telegram":
+            self.telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+            if not self.telegram_bot_token:
+                raise ValueError(
+                    "TELEGRAM_BOT_TOKEN environment variable is required "
+                    "when CCBOT_PLATFORM=telegram"
+                )
+        else:
+            self.telegram_bot_token = ""
+
+        if self.platform == "feishu":
+            self.feishu_app_id: str = os.getenv("FEISHU_APP_ID") or ""
+            self.feishu_app_secret: str = os.getenv("FEISHU_APP_SECRET") or ""
+            if not self.feishu_app_id or not self.feishu_app_secret:
+                raise ValueError(
+                    "FEISHU_APP_ID and FEISHU_APP_SECRET are required "
+                    "when CCBOT_PLATFORM=feishu"
+                )
+            self.feishu_encrypt_key: str = os.getenv("FEISHU_ENCRYPT_KEY") or ""
+            self.feishu_verification_token: str = (
+                os.getenv("FEISHU_VERIFICATION_TOKEN") or ""
+            )
+            # "feishu" for feishu.cn, "lark" for larksuite.com
+            self.feishu_domain: str = os.getenv("FEISHU_DOMAIN", "feishu")
+        else:
+            self.feishu_app_id = ""
+            self.feishu_app_secret = ""
+            self.feishu_encrypt_key = ""
+            self.feishu_verification_token = ""
+            self.feishu_domain = "feishu"
+
+        # --- Allowed users (shared across platforms) ---
         allowed_users_str = os.getenv("ALLOWED_USERS", "")
         if not allowed_users_str:
             raise ValueError("ALLOWED_USERS environment variable is required")
-        try:
-            self.allowed_users: set[int] = {
-                int(uid.strip()) for uid in allowed_users_str.split(",") if uid.strip()
-            }
-        except ValueError as e:
-            raise ValueError(
-                f"ALLOWED_USERS contains non-numeric value: {e}. "
-                "Expected comma-separated Telegram user IDs."
-            ) from e
+        self.allowed_users: set[str] = {
+            uid.strip() for uid in allowed_users_str.split(",") if uid.strip()
+        }
 
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
@@ -85,13 +130,11 @@ class Config:
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
         # Display user messages in history and real-time notifications
-        # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = (
             os.getenv("CCBOT_SHOW_USER_MESSAGES", "true").lower() != "false"
         )
 
-        # Show tool call notifications (tool_use/tool_result) in Telegram
-        # When False, only text responses, thinking, and interactive prompts are sent
+        # Show tool call notifications (tool_use/tool_result)
         self.show_tool_calls = (
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
@@ -108,23 +151,25 @@ class Config:
         )
 
         # Scrub sensitive vars from os.environ so child processes never inherit them.
-        # Values are already captured in Config attributes above.
         for var in SENSITIVE_ENV_VARS:
             os.environ.pop(var, None)
 
         logger.debug(
-            "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
+            "Config initialized: platform=%s, dir=%s, allowed_users=%d, "
             "tmux_session=%s, claude_projects_path=%s",
+            self.platform,
             self.config_dir,
-            self.telegram_bot_token[:8],
             len(self.allowed_users),
             self.tmux_session_name,
             self.claude_projects_path,
         )
 
-    def is_user_allowed(self, user_id: int) -> bool:
-        """Check if a user is in the allowed list."""
-        return user_id in self.allowed_users
+    def is_user_allowed(self, user_id: int | str) -> bool:
+        """Check if a user is in the allowed list.
+
+        Accepts both int (Telegram user_id) and str (Feishu open_id).
+        """
+        return str(user_id) in self.allowed_users
 
 
 config = Config()
