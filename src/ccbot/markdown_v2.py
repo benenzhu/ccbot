@@ -27,78 +27,122 @@ def _split_table_row(line: str) -> list[str]:
     return [cell.strip().replace("\\|", "|") for cell in cells]
 
 
+ParsedTable = tuple[list[str], list[list[str]]]
+"""(headers, rows) — each row is a list of cell strings aligned to headers."""
+
+
+def _scan_tables(text: str) -> list[tuple[int, int, ParsedTable]]:
+    """Locate markdown tables in text.
+
+    Returns a list of (start_line_idx, end_line_idx_exclusive, (headers, rows))
+    tuples. Skips tables inside fenced code blocks.
+    """
+    lines = text.split("\n")
+    found: list[tuple[int, int, ParsedTable]] = []
+    i = 0
+    in_code_block = False
+
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            i += 1
+            continue
+
+        if in_code_block:
+            i += 1
+            continue
+
+        # Header row candidate
+        if (
+            stripped.startswith("|")
+            and stripped.endswith("|")
+            and "|" in stripped[1:-1]
+            and i + 1 < len(lines)
+        ):
+            sep_line = lines[i + 1].strip()
+            if sep_line.startswith("|") and _TABLE_SEP_RE.match(sep_line):
+                headers = _split_table_row(stripped)
+                start = i
+                i += 2
+                rows: list[list[str]] = []
+                while i < len(lines):
+                    data_line = lines[i].strip()
+                    if data_line.startswith("|") and data_line.endswith("|"):
+                        rows.append(_split_table_row(data_line))
+                        i += 1
+                    else:
+                        break
+                found.append((start, i, (headers, rows)))
+                continue
+
+        i += 1
+
+    return found
+
+
+def extract_markdown_tables(text: str) -> tuple[str, list[ParsedTable]]:
+    """Strip markdown tables from text and return them separately.
+
+    Returns (text_without_tables, [(headers, rows), ...]). Each removed table
+    leaves a single blank line at its position so surrounding content stays
+    visually separated. Use this when you want to render tables as images
+    (or some other non-text form) instead of inlining them.
+
+    Tables inside fenced code blocks are preserved.
+    """
+    matches = _scan_tables(text)
+    if not matches:
+        return text, []
+
+    lines = text.split("\n")
+    tables: list[ParsedTable] = []
+    out: list[str] = []
+    cursor = 0
+    for start, end, table in matches:
+        out.extend(lines[cursor:start])
+        out.append("")  # placeholder so adjacent text doesn't collapse
+        tables.append(table)
+        cursor = end
+    out.extend(lines[cursor:])
+    return "\n".join(out), tables
+
+
 def convert_markdown_tables(text: str) -> str:
     """Convert markdown tables to card-style key-value format.
 
     Telegram has no table rendering. This converts each row into a card
     with **Header**: value pairs, separated by horizontal lines — similar
-    to how Claude Code renders tables in narrow terminals.
+    to how Claude Code renders tables in narrow terminals. Used as a text
+    fallback when image rendering isn't applied.
 
     Skips tables inside code blocks.
     """
+    matches = _scan_tables(text)
+    if not matches:
+        return text
+
     lines = text.split("\n")
-    result: list[str] = []
-    i = 0
-    in_code_block = False
-
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        # Track code blocks
-        if stripped.startswith("```"):
-            in_code_block = not in_code_block
-            result.append(line)
-            i += 1
-            continue
-
-        if in_code_block:
-            result.append(line)
-            i += 1
-            continue
-
-        # Check if this looks like a table header row
-        if (
-            stripped.startswith("|")
-            and stripped.endswith("|")
-            and "|" in stripped[1:-1]
-        ):
-            headers = _split_table_row(stripped)
-
-            # Next line must be separator (---|---|---)
-            if i + 1 < len(lines):
-                sep_line = lines[i + 1].strip()
-                if sep_line.startswith("|") and _TABLE_SEP_RE.match(sep_line):
-                    i += 2  # Skip header + separator
-                    rows: list[list[str]] = []
-                    while i < len(lines):
-                        data_line = lines[i].strip()
-                        if data_line.startswith("|") and data_line.endswith("|"):
-                            rows.append(_split_table_row(data_line))
-                            i += 1
-                        else:
-                            break
-
-                    # Build card-style output
-                    separator = "────────────"
-                    cards: list[str] = []
-                    for row in rows:
-                        card_lines: list[str] = []
-                        for j, header in enumerate(headers):
-                            value = row[j] if j < len(row) else ""
-                            if value:
-                                card_lines.append(f"**{header}**: {value}")
-                            else:
-                                card_lines.append(f"**{header}**: —")
-                        cards.append("\n".join(card_lines))
-
-                    result.append(f"\n{separator}\n".join(cards))
-                    continue
-
-        result.append(line)
-        i += 1
-
-    return "\n".join(result)
+    out: list[str] = []
+    cursor = 0
+    separator = "────────────"
+    for start, end, (headers, rows) in matches:
+        out.extend(lines[cursor:start])
+        cards: list[str] = []
+        for row in rows:
+            card_lines: list[str] = []
+            for j, header in enumerate(headers):
+                value = row[j] if j < len(row) else ""
+                if value:
+                    card_lines.append(f"**{header}**: {value}")
+                else:
+                    card_lines.append(f"**{header}**: —")
+            cards.append("\n".join(card_lines))
+        out.append(f"\n{separator}\n".join(cards))
+        cursor = end
+    out.extend(lines[cursor:])
+    return "\n".join(out)
 
 
 _EXPQUOTE_RE = re.compile(

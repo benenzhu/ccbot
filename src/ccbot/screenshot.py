@@ -334,3 +334,158 @@ async def text_to_image(
 
     # Run CPU-intensive image rendering in thread pool
     return await asyncio.to_thread(_render_image)
+
+
+# Substitute color emojis (which our monochrome font fallback can't render)
+# with shape-equivalent characters that exist in JetBrains Mono / Symbola.
+# Applied only at table render time — does not affect chat text.
+_EMOJI_SUBSTITUTIONS: dict[str, str] = {
+    "✅": "✓",  # 2705 → 2713
+    "❎": "✗",  # 274E → 2717
+    "❌": "✗",  # 274C → 2717
+    "✔️": "✓",
+    "✖️": "✗",
+    "⚠️": "!",
+    "⚠": "!",
+    "🔥": "*",
+    "🚀": "→",
+    "📌": "•",
+    "📝": "✎",  # 270E
+    "🔧": "✱",
+    "💡": "*",
+    "ℹ️": "i",
+    "❓": "?",
+    "❔": "?",
+    "❗": "!",
+    "❕": "!",
+}
+
+
+def _normalize_emojis(text: str) -> str:
+    """Replace color emojis with monochrome equivalents for image rendering."""
+    for src, dst in _EMOJI_SUBSTITUTIONS.items():
+        if src in text:
+            text = text.replace(src, dst)
+    return text
+
+
+def _measure_segments(
+    segments: list[tuple[str, int]],
+    fonts: list[ImageFont.FreeTypeFont | ImageFont.ImageFont],
+    draw: ImageDraw.ImageDraw,
+) -> int:
+    """Sum the rendered pixel width of mixed-font segments."""
+    total = 0.0
+    for seg_text, tier in segments:
+        if not seg_text:
+            continue
+        bbox = draw.textbbox((0, 0), seg_text, font=fonts[tier])
+        total += bbox[2] - bbox[0]
+    return int(total)
+
+
+async def render_table_image(
+    headers: list[str], rows: list[list[str]], font_size: int = 22
+) -> bytes:
+    """Render a markdown table as a PNG image with PIL primitives.
+
+    Lays out cells using actual rendered pixel widths (per font tier), draws
+    borders with `draw.line()`, and places text inside each cell. This avoids
+    the alignment drift that arises from approximating cell widths via space
+    padding when ASCII / CJK / symbol fonts have slightly different metrics.
+
+    Color emojis are substituted with monochrome equivalents from
+    _EMOJI_SUBSTITUTIONS so they render with the existing font fallback chain.
+    """
+
+    def _render() -> bytes:
+        fonts = [_load_font(p, font_size) for p in _FONT_PATHS]
+
+        n_cols = len(headers)
+        # Normalize each row to header count
+        norm_rows: list[list[str]] = []
+        for row in rows:
+            if len(row) < n_cols:
+                norm_rows.append(list(row) + [""] * (n_cols - len(row)))
+            else:
+                norm_rows.append(list(row[:n_cols]))
+
+        # Substitute emojis and split each cell into mixed-font segments
+        all_rows: list[list[str]] = [list(headers)] + norm_rows
+        cell_segments: list[list[list[tuple[str, int]]]] = [
+            [_split_line_segments_plain(_normalize_emojis(c)) for c in row]
+            for row in all_rows
+        ]
+
+        dummy = Image.new("RGB", (1, 1))
+        dummy_draw = ImageDraw.Draw(dummy)
+
+        # Per-column max content pixel width
+        col_widths = [0] * n_cols
+        for row_segs in cell_segments:
+            for j, segs in enumerate(row_segs):
+                w = _measure_segments(segs, fonts, dummy_draw)
+                if w > col_widths[j]:
+                    col_widths[j] = w
+
+        # Layout constants
+        cell_pad_x = 12  # Horizontal padding inside each cell
+        cell_pad_y = 6  # Vertical padding inside each cell
+        line_height = int(font_size * 1.4)
+        row_height = line_height + cell_pad_y * 2
+        outer_pad = 8  # Outer margin around the table
+        border_color = (170, 170, 170)
+        text_color = _DEFAULT_FG
+
+        # Column x positions (left edge of each cell, including borders)
+        col_lefts: list[int] = [outer_pad]
+        for w in col_widths:
+            col_lefts.append(col_lefts[-1] + w + cell_pad_x * 2)
+        table_width = col_lefts[-1] - outer_pad
+
+        n_rows_total = len(all_rows)  # Includes header
+        table_height = row_height * n_rows_total
+        img_width = table_width + outer_pad * 2
+        img_height = table_height + outer_pad * 2
+
+        img = Image.new("RGB", (img_width, img_height), _DEFAULT_BG)
+        draw = ImageDraw.Draw(img)
+
+        # Draw cell text first (so borders sit on top)
+        for r_idx, row_segs in enumerate(cell_segments):
+            y = outer_pad + r_idx * row_height + cell_pad_y
+            for j, segs in enumerate(row_segs):
+                x = col_lefts[j] + cell_pad_x
+                for seg_text, tier in segs:
+                    if not seg_text:
+                        continue
+                    f = fonts[tier]
+                    draw.text((x, y), seg_text, fill=text_color, font=f)
+                    bbox = draw.textbbox((0, 0), seg_text, font=f)
+                    x += bbox[2] - bbox[0]
+
+        # Draw horizontal lines: top, after-header, between rows, bottom
+        top = outer_pad
+        bottom = outer_pad + table_height
+        right = outer_pad + table_width
+        h_lines_y = [top + r * row_height for r in range(n_rows_total + 1)]
+        for y in h_lines_y:
+            draw.line([(outer_pad, y), (right, y)], fill=border_color, width=1)
+
+        # Draw vertical lines: left, between cols, right
+        for x in col_lefts:
+            draw.line([(x, top), (x, bottom)], fill=border_color, width=1)
+
+        # Slightly emphasize the header separator
+        header_sep_y = top + row_height
+        draw.line(
+            [(outer_pad, header_sep_y), (right, header_sep_y)],
+            fill=text_color,
+            width=2,
+        )
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True, compress_level=9)
+        return buf.getvalue()
+
+    return await asyncio.to_thread(_render)

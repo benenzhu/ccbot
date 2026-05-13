@@ -126,10 +126,11 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
-from .markdown_v2 import convert_markdown
+from .markdown_v2 import convert_markdown, extract_markdown_tables
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
-from .screenshot import text_to_image
+from .monitor_state import TrackedSession
+from .screenshot import render_table_image, text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
@@ -997,15 +998,39 @@ async def _create_and_bind_window(
     selected_path: str,
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
+    resume_file_path: str | None = None,
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
     Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+
+    On resume, pre-seeds the monitor's byte offset to 0 so the next poll cycle
+    replays the entire JSONL history to Telegram, and discards any pending text
+    so the user can review history before sending new messages.
     """
     from telegram import CallbackQuery, User
 
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
+
+    # Pre-seed monitor offset BEFORE the window starts so the very first poll
+    # cycle reads the JSONL from byte 0 and replays history into Telegram.
+    # Done before window creation to avoid a race with the 2s poll loop.
+    if resume_session_id and resume_file_path and session_monitor is not None:
+        session_monitor.state.update_session(
+            TrackedSession(
+                session_id=resume_session_id,
+                file_path=resume_file_path,
+                last_byte_offset=0,
+            )
+        )
+        session_monitor.state.save()
+        session_monitor._file_mtimes.pop(resume_session_id, None)
+        logger.info(
+            "Pre-seeded monitor offset=0 for resumed session %s (path=%s)",
+            resume_session_id,
+            resume_file_path,
+        )
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
         selected_path, resume_session_id=resume_session_id
@@ -1020,50 +1045,24 @@ async def _create_and_bind_window(
             pending_thread_id,
             resume_session_id,
         )
-        # Wait for Claude Code's SessionStart hook to register in session_map.
-        # Resume sessions take longer to start (loading session state), so use
-        # a longer timeout to avoid silently dropping messages.
-        hook_timeout = 15.0 if resume_session_id else 5.0
-        hook_ok = await session_manager.wait_for_session_map_entry(
-            created_wid, timeout=hook_timeout
-        )
 
-        # --resume creates a new session_id in the hook, but messages continue
-        # writing to the resumed session's JSONL file. Override window_state to
-        # track the original session_id so the monitor can route messages back.
+        # On resume, wire up routing (window_state.session_id + thread binding)
+        # BEFORE waiting for the hook. Otherwise the monitor's poll cycle can
+        # fire between hook write and bind_thread, dispatching replayed history
+        # messages with no active users → silently dropped.
         if resume_session_id:
             ws = session_manager.get_window_state(created_wid)
-            if not hook_ok:
-                # Hook timed out — manually populate window_state so the
-                # monitor can still route messages back to this topic.
-                logger.warning(
-                    "Hook timed out for resume window %s, "
-                    "manually setting session_id=%s cwd=%s",
-                    created_wid,
-                    resume_session_id,
-                    selected_path,
-                )
-                ws.session_id = resume_session_id
-                ws.cwd = str(selected_path)
-                ws.window_name = created_wname
-                session_manager._save_state()
-            elif ws.session_id != resume_session_id:
-                logger.info(
-                    "Resume override: window %s session_id %s -> %s",
-                    created_wid,
-                    ws.session_id,
-                    resume_session_id,
-                )
-                ws.session_id = resume_session_id
-                session_manager._save_state()
+            ws.session_id = resume_session_id
+            ws.cwd = str(selected_path)
+            ws.window_name = created_wname
+            session_manager._save_state()
 
+        resolved_chat: int = 0
         if pending_thread_id is not None:
-            # Thread bind flow: bind thread to newly created window
             session_manager.bind_thread(
                 user.id, pending_thread_id, created_wid, window_name=created_wname
             )
 
-            # Rename the topic to match the window name
             resolved_chat = session_manager.resolve_chat_id(user.id, pending_thread_id)
             try:
                 await context.bot.edit_forum_topic(
@@ -1074,41 +1073,95 @@ async def _create_and_bind_window(
             except Exception as e:
                 logger.debug(f"Failed to rename topic: {e}")
 
-            status = "Resumed" if resume_session_id else "Created"
-            await safe_edit(
-                query,
-                f"✅ {message}\n\n{status}. Send messages here.",
-            )
+        # Wait for Claude Code's SessionStart hook to register in session_map.
+        # Resume sessions take longer to start (loading session state), so use
+        # a longer timeout to avoid silently dropping messages.
+        hook_timeout = 15.0 if resume_session_id else 5.0
+        hook_ok = await session_manager.wait_for_session_map_entry(
+            created_wid, timeout=hook_timeout
+        )
 
-            # Send pending text if any
-            pending_text = (
-                context.user_data.get("_pending_thread_text")
-                if context.user_data
-                else None
-            )
-            if pending_text:
-                logger.debug(
-                    "Forwarding pending text to window %s (len=%d)",
-                    created_wname,
-                    len(pending_text),
+        # If the hook reported a session_id that differs from resume_session_id
+        # (e.g. on older Claude versions), the session_map sync may have
+        # overwritten ws.session_id. Restore it so the monitor routes to the
+        # original JSONL.
+        if resume_session_id:
+            ws = session_manager.get_window_state(created_wid)
+            if not hook_ok:
+                logger.warning(
+                    "Hook timed out for resume window %s; routing already wired "
+                    "with session_id=%s",
+                    created_wid,
+                    resume_session_id,
+                )
+            elif ws.session_id != resume_session_id:
+                logger.info(
+                    "Resume override after hook: window %s session_id %s -> %s",
+                    created_wid,
+                    ws.session_id,
+                    resume_session_id,
+                )
+                ws.session_id = resume_session_id
+                session_manager._save_state()
+
+        if pending_thread_id is not None:
+            if resume_session_id:
+                # Resume: discard any pending text so the user can review the
+                # replayed history first and then decide what to send next.
+                discarded = (
+                    context.user_data.pop("_pending_thread_text", None)
+                    if context.user_data
+                    else None
                 )
                 if context.user_data is not None:
-                    context.user_data.pop("_pending_thread_text", None)
                     context.user_data.pop("_pending_thread_id", None)
-                send_ok, send_msg = await session_manager.send_to_window(
-                    created_wid,
-                    pending_text,
-                )
-                if not send_ok:
-                    logger.warning("Failed to forward pending text: %s", send_msg)
-                    await safe_send(
-                        context.bot,
-                        resolved_chat,
-                        f"❌ Failed to send pending message: {send_msg}",
-                        message_thread_id=pending_thread_id,
+                if discarded:
+                    logger.debug(
+                        "Discarded pending text on resume (len=%d)", len(discarded)
                     )
-            elif context.user_data is not None:
-                context.user_data.pop("_pending_thread_id", None)
+                note = (
+                    " Replaying history; your trigger message was not sent."
+                    if discarded
+                    else " Replaying history."
+                )
+                await safe_edit(
+                    query,
+                    f"✅ {message}\n\nResumed.{note}",
+                )
+            else:
+                await safe_edit(
+                    query,
+                    f"✅ {message}\n\nCreated. Send messages here.",
+                )
+                # Send pending text if any
+                pending_text = (
+                    context.user_data.get("_pending_thread_text")
+                    if context.user_data
+                    else None
+                )
+                if pending_text:
+                    logger.debug(
+                        "Forwarding pending text to window %s (len=%d)",
+                        created_wname,
+                        len(pending_text),
+                    )
+                    if context.user_data is not None:
+                        context.user_data.pop("_pending_thread_text", None)
+                        context.user_data.pop("_pending_thread_id", None)
+                    send_ok, send_msg = await session_manager.send_to_window(
+                        created_wid,
+                        pending_text,
+                    )
+                    if not send_ok:
+                        logger.warning("Failed to forward pending text: %s", send_msg)
+                        await safe_send(
+                            context.bot,
+                            resolved_chat,
+                            f"❌ Failed to send pending message: {send_msg}",
+                            message_thread_id=pending_thread_id,
+                        )
+                elif context.user_data is not None:
+                    context.user_data.pop("_pending_thread_id", None)
         else:
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
@@ -1384,6 +1437,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             selected_path,
             pending_tid,
             resume_session_id=session.session_id,
+            resume_file_path=session.file_path,
         )
 
     elif data == CB_SESSION_NEW:
@@ -1768,20 +1822,49 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await clear_interactive_msg(user_id, bot, thread_id)
 
         # Skip tool call notifications when CCBOT_SHOW_TOOL_CALLS=false
-        if not config.show_tool_calls and msg.content_type in ("tool_use", "tool_result"):
+        if not config.show_tool_calls and msg.content_type in (
+            "tool_use",
+            "tool_result",
+        ):
             continue
 
+        # Extract markdown tables and render them as PNG images so Telegram
+        # users see real tables instead of card-style text. Only complete
+        # messages get this treatment — partial streams may have unfinished
+        # table syntax.
+        text_for_parts = msg.text
+        table_images: list[tuple[str, bytes]] = []
+        if msg.is_complete and msg.content_type != "thinking":
+            stripped, tables = extract_markdown_tables(msg.text)
+            if tables:
+                text_for_parts = stripped
+                for idx, (headers, rows) in enumerate(tables):
+                    try:
+                        png = await render_table_image(headers, rows)
+                        table_images.append((f"table_{idx + 1}.png", png))
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to render table %d as image: %s; "
+                            "falling back to inline text",
+                            idx + 1,
+                            e,
+                        )
+                        # Fallback: keep the table inline as card-style text
+                        text_for_parts = msg.text
+                        table_images = []
+                        break
+
         parts = build_response_parts(
-            msg.text,
+            text_for_parts,
             msg.is_complete,
             msg.content_type,
             msg.role,
         )
 
         if msg.is_complete:
-            # Enqueue content message task
-            # Note: tool_result editing is handled inside _process_content_task
-            # to ensure sequential processing with tool_use message sending
+            # Combine message-attached images (tool_result base64) with
+            # any table images we just rendered.
+            combined_images = list(msg.image_data or []) + table_images
             await enqueue_content_message(
                 bot=bot,
                 user_id=user_id,
@@ -1791,7 +1874,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 content_type=msg.content_type,
                 text=msg.text,
                 thread_id=thread_id,
-                image_data=msg.image_data,
+                image_data=combined_images or None,
             )
 
             # Update user's read offset to current file position
