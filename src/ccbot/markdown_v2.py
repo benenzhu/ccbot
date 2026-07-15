@@ -9,10 +9,13 @@ Key function: convert_markdown(text) → MarkdownV2 string.
 """
 
 import re
+from collections.abc import Iterable
 
 import mistletoe
+from mistletoe import block_token
 from mistletoe.block_token import BlockCode, remove_token
 from telegramify_markdown import _update_block, escape_latex
+from telegramify_markdown import markdown as tg_markdown
 from telegramify_markdown.render import TelegramMarkdownRenderer
 
 from .transcript_parser import TranscriptParser
@@ -197,6 +200,32 @@ def _render_expandable_quote(m: re.Match[str]) -> str:
     return "\n".join(built) + "||"
 
 
+class _PlainHeadingRenderer(TelegramMarkdownRenderer):
+    """TelegramMarkdownRenderer without the emoji heading prefixes.
+
+    The library prefixes headings with 📌/✏️/📚/🔖 by level; we render
+    them as plain bold text instead.
+    """
+
+    def render_heading(
+        self, token: block_token.Heading, max_line_length: int
+    ) -> Iterable[str]:
+        line = next(
+            iter(
+                self.span_to_lines(
+                    token.children,  # type: ignore[arg-type]
+                    max_line_length=max_line_length,
+                )
+            ),
+            "",
+        )
+        if token.closing_sequence:
+            line += " " + token.closing_sequence
+        if not line:
+            return []
+        return [tg_markdown.bold(line)]
+
+
 def _markdownify(text: str) -> str:
     """Custom markdownify with our rendering rules.
 
@@ -207,8 +236,9 @@ def _markdownify(text: str) -> str:
 
     Custom rules:
       - Disable indented code blocks (only fenced ``` blocks are code).
+      - Headings render as plain bold, no emoji prefix.
     """
-    with TelegramMarkdownRenderer(normalize_whitespace=False) as renderer:
+    with _PlainHeadingRenderer(normalize_whitespace=False) as renderer:
         remove_token(BlockCode)
         content = escape_latex(text)
         document = mistletoe.Document(content)
