@@ -31,6 +31,7 @@ from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
+from ..tts import synthesize_speech
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -55,7 +56,7 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear"]
+    task_type: Literal["content", "status_update", "status_clear", "voice"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -212,10 +213,10 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                 if flood_end > 0:
                     remaining = flood_end - time.monotonic()
                     if remaining > 0:
-                        if task.task_type != "content":
+                        if task.task_type in ("status_update", "status_clear"):
                             # Status is ephemeral — safe to drop
                             continue
-                        # Content is actual Claude output — wait then send
+                        # Content/voice is actual Claude output — wait then send
                         logger.debug(
                             "Flood controlled: waiting %.0fs for content (user %d)",
                             remaining,
@@ -241,6 +242,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     await _process_status_update_task(bot, user_id, task)
                 elif task.task_type == "status_clear":
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+                elif task.task_type == "voice":
+                    await _process_voice_task(bot, user_id, task)
             except RetryAfter as e:
                 retry_secs = (
                     e.retry_after
@@ -383,6 +386,49 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
 
     # 5. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
+
+
+async def _process_voice_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Synthesize the final reply text and send it as a voice message.
+
+    Transient provider errors get one retry (volcano occasionally resets
+    streams server-side). TTS failures are logged and swallowed — the text
+    reply was already delivered, so a missing voice clip must never crash
+    the worker.
+    """
+    if not task.text:
+        return
+    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    audio: bytes | None = None
+    for attempt in range(2):
+        try:
+            audio = await synthesize_speech(task.text)
+            break
+        except ValueError as e:
+            # Nothing speakable (e.g. reply was all code) — skip quietly
+            logger.debug("Skipping voice reply: %s", e)
+            return
+        except Exception as e:
+            if attempt == 0:
+                logger.warning("TTS synthesis failed, retrying once: %s", e)
+                await asyncio.sleep(2.0)
+            else:
+                logger.error(
+                    "TTS synthesis failed after retry for user %d: %s", user_id, e
+                )
+                return
+    if audio is None:
+        return
+    try:
+        await bot.send_voice(
+            chat_id=chat_id,
+            voice=audio,
+            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+        )
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error("Failed to send voice message to %d: %s", user_id, e)
 
 
 async def _convert_status_to_content(
@@ -622,6 +668,26 @@ async def enqueue_content_message(
         image_data=image_data,
     )
     queue.put_nowait(task)
+
+
+async def enqueue_voice_message(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    text: str,
+    thread_id: int | None = None,
+) -> None:
+    """Enqueue a TTS voice reply of the final assistant message."""
+    logger.debug("Enqueue voice: user=%d, window_id=%s", user_id, window_id)
+    queue = get_or_create_queue(bot, user_id)
+    queue.put_nowait(
+        MessageTask(
+            task_type="voice",
+            text=text,
+            window_id=window_id,
+            thread_id=thread_id,
+        )
+    )
 
 
 async def enqueue_status_update(

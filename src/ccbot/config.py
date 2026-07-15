@@ -19,7 +19,14 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Env vars that must not leak to child processes (e.g. Claude Code via tmux)
-SENSITIVE_ENV_VARS = {"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "OPENAI_API_KEY"}
+SENSITIVE_ENV_VARS = {
+    "TELEGRAM_BOT_TOKEN",
+    "ALLOWED_USERS",
+    "OPENAI_API_KEY",
+    "AZURE_SPEECH_KEY",
+    "VOLCANO_TTS_ACCESS_KEY",
+    "VOLCANO_TTS_API_KEY",
+}
 
 
 class Config:
@@ -105,6 +112,33 @@ class Config:
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
+        )
+
+        # Text-to-speech: read Claude's final reply aloud as a voice message
+        # (optional, off by default). Triggered by the Claude Code Stop hook.
+        self.tts_enabled = os.getenv("CCBOT_TTS", "").lower() == "true"
+        # Provider: "openai" (uses OPENAI_API_KEY/OPENAI_BASE_URL),
+        # "azure" (uses AZURE_SPEECH_KEY/AZURE_SPEECH_REGION, free F0 tier),
+        # or "volcano" (火山引擎豆包语音, uses VOLCANO_TTS_* vars)
+        self.tts_provider = os.getenv("CCBOT_TTS_PROVIDER", "openai")
+        self.tts_model = os.getenv("CCBOT_TTS_MODEL", "gpt-4o-mini-tts")
+        # Empty means provider default (openai: alloy, azure: zh-CN-XiaoxiaoNeural,
+        # volcano: zh_female_vv_uranus_bigtts / Vivi 2.0)
+        self.tts_voice = os.getenv("CCBOT_TTS_VOICE", "")
+        # Azure F0 caps a single request at 3000 chars; OpenAI at 4096
+        self.tts_max_chars = int(os.getenv("CCBOT_TTS_MAX_CHARS", "3000"))
+        # Playback speed ratio, 1.0 = normal (volcano supports 0.5-2.0)
+        self.tts_speed = float(os.getenv("CCBOT_TTS_SPEED", "1.0"))
+        self.azure_speech_key: str = os.getenv("AZURE_SPEECH_KEY", "")
+        self.azure_speech_region: str = os.getenv("AZURE_SPEECH_REGION", "eastasia")
+        # Volcano Engine (豆包语音) v3 API. Auth is either app_id + access_key
+        # (classic console) or api_key alone (new console).
+        self.volcano_tts_app_id: str = os.getenv("VOLCANO_TTS_APP_ID", "")
+        self.volcano_tts_access_key: str = os.getenv("VOLCANO_TTS_ACCESS_KEY", "")
+        self.volcano_tts_api_key: str = os.getenv("VOLCANO_TTS_API_KEY", "")
+        # seed-tts-2.0 (3元/万字符) | seed-tts-1.0 | seed-icl-2.0 (声音复刻)
+        self.volcano_tts_resource_id: str = os.getenv(
+            "VOLCANO_TTS_RESOURCE_ID", "seed-tts-2.0"
         )
 
         # Scrub sensitive vars from os.environ so child processes never inherit them.

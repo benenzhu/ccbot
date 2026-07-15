@@ -2,6 +2,7 @@
 
 Provides:
   - ccbot_dir(): resolve config directory from CCBOT_DIR env var.
+  - stop_signals_dir(): directory of Stop-hook marker files (for TTS).
   - atomic_write_json(): crash-safe JSON file writes via temp+rename.
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
 """
@@ -19,6 +20,17 @@ def ccbot_dir() -> Path:
     """Resolve config directory from CCBOT_DIR env var or default ~/.ccbot."""
     raw = os.environ.get(CCBOT_DIR_ENV, "")
     return Path(raw) if raw else Path.home() / ".ccbot"
+
+
+def stop_signals_dir() -> Path:
+    """Directory where the Stop hook drops per-session marker files.
+
+    The hook touches <dir>/<session_id> when Claude finishes a turn;
+    the session monitor consumes (and deletes) markers each poll cycle.
+    Shared by hook.py and session_monitor.py — hook.py must not import
+    config.py, so this lives here.
+    """
+    return ccbot_dir() / "stop_signals"
 
 
 def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:

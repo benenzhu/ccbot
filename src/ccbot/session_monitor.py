@@ -24,7 +24,7 @@ from .config import config
 from .monitor_state import MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
-from .utils import read_cwd_from_jsonl
+from .utils import read_cwd_from_jsonl, stop_signals_dir
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class NewMessage:
     session_id: str
     text: str
     is_complete: bool  # True when stop_reason is set (final message)
-    content_type: str = "text"  # "text" or "thinking"
+    content_type: str = "text"  # "text", "thinking", or "tts" (voice reply)
     tool_use_id: str | None = None
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
@@ -84,6 +84,9 @@ class SessionMonitor:
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # Last assistant text per session, spoken via TTS when the Stop
+        # hook signals the end of a turn (not persisted)
+        self._last_assistant_text: dict[str, str] = {}
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -348,6 +351,10 @@ class SessionMonitor:
                 for entry in parsed_entries:
                     if not entry.text and not entry.image_data:
                         continue
+                    # Remember the latest assistant text — spoken via TTS
+                    # when the Stop hook marks the end of the turn
+                    if entry.role == "assistant" and entry.content_type == "text":
+                        self._last_assistant_text[session_info.session_id] = entry.text
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
@@ -370,7 +377,51 @@ class SessionMonitor:
                 logger.debug(f"Error processing session {session_info.session_id}: {e}")
 
         self.state.save_if_dirty()
+
+        # Stop-hook markers are checked after transcript reads so the final
+        # text of the turn is already captured in _last_assistant_text
+        new_messages.extend(self._collect_stop_signals(active_session_ids))
         return new_messages
+
+    def _collect_stop_signals(self, active_session_ids: set[str]) -> list[NewMessage]:
+        """Consume Stop-hook marker files and emit TTS messages.
+
+        Markers are always deleted (even with TTS disabled) so they never
+        accumulate. A marker only yields a message when TTS is enabled,
+        the session is actively monitored, and we have assistant text.
+        """
+        signals_dir = stop_signals_dir()
+        if not signals_dir.is_dir():
+            return []
+
+        messages: list[NewMessage] = []
+        try:
+            markers = list(signals_dir.iterdir())
+        except OSError:
+            return []
+        for marker in markers:
+            session_id = marker.name
+            try:
+                marker.unlink()
+            except OSError:
+                continue
+            if not config.tts_enabled:
+                continue
+            if session_id not in active_session_ids:
+                continue
+            text = self._last_assistant_text.get(session_id)
+            if not text:
+                continue
+            logger.info("Stop signal for session %s, emitting TTS message", session_id)
+            messages.append(
+                NewMessage(
+                    session_id=session_id,
+                    text=text,
+                    is_complete=True,
+                    content_type="tts",
+                )
+            )
+        return messages
 
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.
@@ -417,6 +468,7 @@ class SessionMonitor:
             for session_id in stale_sessions:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._last_assistant_text.pop(session_id, None)
             self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
@@ -459,6 +511,7 @@ class SessionMonitor:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._last_assistant_text.pop(session_id, None)
             self.state.save_if_dirty()
 
         # Update last known map

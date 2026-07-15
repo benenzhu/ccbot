@@ -1,8 +1,10 @@
 """Hook subcommand for Claude Code session tracking.
 
 Called by Claude Code's SessionStart hook to maintain a window↔session
-mapping in <CCBOT_DIR>/session_map.json. Also provides `--install` to
-auto-configure the hook in ~/.claude/settings.json.
+mapping in <CCBOT_DIR>/session_map.json, and by the Stop hook to drop a
+per-session marker file (consumed by the monitor to trigger TTS voice
+replies). Also provides `--install` to auto-configure both hooks in
+~/.claude/settings.json.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
 since hooks run inside tmux panes where bot env vars are not set.
@@ -32,6 +34,9 @@ _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 # The hook command suffix for detection
 _HOOK_COMMAND_SUFFIX = "ccbot hook"
 
+# Hook events we handle; --install registers all of them
+_HOOK_EVENTS = ["SessionStart", "Stop"]
+
 
 def _find_ccbot_path() -> str:
     """Find the full path to the ccbot executable.
@@ -56,15 +61,15 @@ def _find_ccbot_path() -> str:
     return "ccbot"
 
 
-def _is_hook_installed(settings: dict) -> bool:
-    """Check if ccbot hook is already installed in the settings.
+def _is_hook_installed(settings: dict, event: str) -> bool:
+    """Check if ccbot hook is already installed for the given event.
 
     Detects both 'ccbot hook' and full paths like '/path/to/ccbot hook'.
     """
     hooks = settings.get("hooks", {})
-    session_start = hooks.get("SessionStart", [])
+    entries = hooks.get(event, [])
 
-    for entry in session_start:
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         inner_hooks = entry.get("hooks", [])
@@ -96,8 +101,9 @@ def _install_hook() -> int:
             print(f"Error reading {settings_file}: {e}", file=sys.stderr)
             return 1
 
-    # Check if already installed
-    if _is_hook_installed(settings):
+    # Install for each event not yet configured
+    missing_events = [e for e in _HOOK_EVENTS if not _is_hook_installed(settings, e)]
+    if not missing_events:
         logger.info("Hook already installed in %s", settings_file)
         print(f"Hook already installed in {settings_file}")
         return 0
@@ -106,15 +112,16 @@ def _install_hook() -> int:
     ccbot_path = _find_ccbot_path()
     hook_command = f"{ccbot_path} hook"
     hook_config = {"type": "command", "command": hook_command, "timeout": 5}
-    logger.info("Installing hook command: %s", hook_command)
+    logger.info(
+        "Installing hook command: %s (events: %s)", hook_command, missing_events
+    )
 
-    # Install the hook
     if "hooks" not in settings:
         settings["hooks"] = {}
-    if "SessionStart" not in settings["hooks"]:
-        settings["hooks"]["SessionStart"] = []
-
-    settings["hooks"]["SessionStart"].append({"hooks": [hook_config]})
+    for event in missing_events:
+        if event not in settings["hooks"]:
+            settings["hooks"][event] = []
+        settings["hooks"][event].append({"hooks": [dict(hook_config)]})
 
     # Write back
     try:
@@ -129,6 +136,24 @@ def _install_hook() -> int:
     logger.info("Hook installed successfully in %s", settings_file)
     print(f"Hook installed successfully in {settings_file}")
     return 0
+
+
+def _handle_stop(session_id: str) -> None:
+    """Drop a per-session marker file when Claude finishes a turn.
+
+    The session monitor consumes these markers to send the final reply
+    as a TTS voice message. session_id is UUID-validated by the caller,
+    so it is safe to use as a filename.
+    """
+    from .utils import stop_signals_dir
+
+    signals_dir = stop_signals_dir()
+    try:
+        signals_dir.mkdir(parents=True, exist_ok=True)
+        (signals_dir / session_id).touch()
+        logger.debug("Wrote stop signal for session %s", session_id)
+    except OSError as e:
+        logger.error("Failed to write stop signal: %s", e)
 
 
 def hook_main() -> None:
@@ -180,6 +205,10 @@ def hook_main() -> None:
     # Validate cwd is an absolute path (if provided)
     if cwd and not os.path.isabs(cwd):
         logger.warning("cwd is not absolute: %s", cwd)
+        return
+
+    if event == "Stop":
+        _handle_stop(session_id)
         return
 
     if event != "SessionStart":

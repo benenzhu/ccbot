@@ -49,10 +49,24 @@ class TestIsHookInstalled:
                 ]
             }
         }
-        assert _is_hook_installed(settings) is True
+        assert _is_hook_installed(settings, "SessionStart") is True
 
     def test_no_hooks_key(self) -> None:
-        assert _is_hook_installed({}) is False
+        assert _is_hook_installed({}, "SessionStart") is False
+
+    def test_event_not_installed(self) -> None:
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "ccbot hook", "timeout": 5}
+                        ]
+                    }
+                ]
+            }
+        }
+        assert _is_hook_installed(settings, "Stop") is False
 
     def test_different_hook_command(self) -> None:
         settings = {
@@ -62,7 +76,7 @@ class TestIsHookInstalled:
                 ]
             }
         }
-        assert _is_hook_installed(settings) is False
+        assert _is_hook_installed(settings, "SessionStart") is False
 
     def test_full_path_matches(self) -> None:
         settings = {
@@ -80,7 +94,7 @@ class TestIsHookInstalled:
                 ]
             }
         }
-        assert _is_hook_installed(settings) is True
+        assert _is_hook_installed(settings, "SessionStart") is True
 
 
 class TestHookMainValidation:

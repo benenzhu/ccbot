@@ -116,6 +116,7 @@ from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
     enqueue_status_update,
+    enqueue_voice_message,
     get_message_queue,
     shutdown_workers,
 )
@@ -137,6 +138,7 @@ from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
+from .tts import close_client as close_tts_client
 from .utils import ccbot_dir
 
 logger = logging.getLogger(__name__)
@@ -1789,6 +1791,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         logger.info(f"No active users for session {msg.session_id}")
         return
 
+    # TTS voice reply of the final turn text — no parts/table processing
+    if msg.content_type == "tts":
+        for user_id, wid, thread_id in active_users:
+            await enqueue_voice_message(bot, user_id, wid, msg.text, thread_id)
+        return
+
     for user_id, wid, thread_id in active_users:
         # Handle interactive tools specially - capture terminal and send UI
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
@@ -1961,6 +1969,7 @@ async def post_shutdown(application: Application) -> None:
         logger.info("Session monitor stopped")
 
     await close_transcribe_client()
+    await close_tts_client()
 
 
 def create_bot() -> Application:
