@@ -114,8 +114,8 @@ class Config:
             "OPENAI_BASE_URL", "https://api.openai.com/v1"
         )
 
-        # Text-to-speech: read Claude's final reply aloud as a voice message
-        # (optional, off by default). Triggered by the Claude Code Stop hook.
+        # Text-to-speech: read each assistant reply aloud as a voice message
+        # (optional, off by default).
         self.tts_enabled = os.getenv("CCBOT_TTS", "").lower() == "true"
         # Provider: "openai" (uses OPENAI_API_KEY/OPENAI_BASE_URL),
         # "azure" (uses AZURE_SPEECH_KEY/AZURE_SPEECH_REGION, free F0 tier),
@@ -127,6 +127,10 @@ class Config:
         self.tts_voice = os.getenv("CCBOT_TTS_VOICE", "")
         # Azure F0 caps a single request at 3000 chars; OpenAI at 4096
         self.tts_max_chars = int(os.getenv("CCBOT_TTS_MAX_CHARS", "3000"))
+        # Long replies are split at sentence boundaries into segments of at
+        # most this many chars, synthesized in parallel and sent in order,
+        # so the first voice bubble arrives quickly. 0 disables splitting.
+        self.tts_segment_chars = int(os.getenv("CCBOT_TTS_SEGMENT_CHARS", "180"))
         # Playback speed ratio, 1.0 = normal (volcano supports 0.5-2.0)
         self.tts_speed = float(os.getenv("CCBOT_TTS_SPEED", "1.0"))
         self.azure_speech_key: str = os.getenv("AZURE_SPEECH_KEY", "")

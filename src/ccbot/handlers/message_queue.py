@@ -31,7 +31,7 @@ from ..markdown_v2 import convert_markdown
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
-from ..tts import synthesize_speech
+from ..tts import prepare_tts_segments, synthesize_prepared
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
@@ -388,26 +388,20 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
 
 
-async def _process_voice_task(bot: Bot, user_id: int, task: MessageTask) -> None:
-    """Synthesize the final reply text and send it as a voice message.
+async def _synthesize_segment(segment: str, user_id: int) -> bytes | None:
+    """Synthesize one segment, retrying once on transient provider errors.
 
-    Transient provider errors get one retry (volcano occasionally resets
-    streams server-side). TTS failures are logged and swallowed — the text
-    reply was already delivered, so a missing voice clip must never crash
-    the worker.
+    Volcano occasionally resets streams server-side, so a single retry
+    recovers most failures. Returns None when synthesis is hopeless —
+    callers skip that segment rather than aborting the whole reply.
     """
-    if not task.text:
-        return
-    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
-    audio: bytes | None = None
     for attempt in range(2):
         try:
-            audio = await synthesize_speech(task.text)
-            break
+            return await synthesize_prepared(segment)
         except ValueError as e:
-            # Nothing speakable (e.g. reply was all code) — skip quietly
-            logger.debug("Skipping voice reply: %s", e)
-            return
+            # Nothing speakable (e.g. segment was all code) — skip quietly
+            logger.debug("Skipping voice segment: %s", e)
+            return None
         except Exception as e:
             if attempt == 0:
                 logger.warning("TTS synthesis failed, retrying once: %s", e)
@@ -416,19 +410,60 @@ async def _process_voice_task(bot: Bot, user_id: int, task: MessageTask) -> None
                 logger.error(
                     "TTS synthesis failed after retry for user %d: %s", user_id, e
                 )
-                return
-    if audio is None:
+    return None
+
+
+async def _process_voice_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Synthesize the reply text and send it as voice message(s).
+
+    Long replies are split into segments; segment N+1 is synthesized while
+    N is being sent, so the first voice bubble arrives after one short
+    synthesis instead of the whole reply. Segments are still *sent* in
+    order. TTS failures are logged and swallowed — the text reply was
+    already delivered, so a missing voice clip must never crash the worker.
+    """
+    if not task.text:
         return
-    try:
-        await bot.send_voice(
-            chat_id=chat_id,
-            voice=audio,
-            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+    segments = prepare_tts_segments(task.text)
+    if not segments:
+        return
+    if len(segments) > 1:
+        logger.debug(
+            "Voice reply split into %d segments for user %d", len(segments), user_id
         )
-    except RetryAfter:
-        raise
-    except Exception as e:
-        logger.error("Failed to send voice message to %d: %s", user_id, e)
+    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+
+    pending: asyncio.Task[bytes | None] | None = asyncio.create_task(
+        _synthesize_segment(segments[0], user_id)
+    )
+    try:
+        for i in range(len(segments)):
+            current = pending
+            assert current is not None  # one task is always queued per iteration
+            # Kick off the next synthesis before awaiting the current send
+            pending = (
+                asyncio.create_task(_synthesize_segment(segments[i + 1], user_id))
+                if i + 1 < len(segments)
+                else None
+            )
+            audio = await current
+            if audio is None:
+                continue
+            try:
+                await bot.send_voice(
+                    chat_id=chat_id,
+                    voice=audio,
+                    **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+                )
+            except RetryAfter:
+                raise
+            except Exception as e:
+                logger.error("Failed to send voice message to %d: %s", user_id, e)
+                return
+    finally:
+        # Don't leak an in-flight prefetch if we bailed out early
+        if pending is not None and not pending.done():
+            pending.cancel()
 
 
 async def _convert_status_to_content(

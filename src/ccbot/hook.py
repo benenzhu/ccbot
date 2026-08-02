@@ -1,10 +1,8 @@
 """Hook subcommand for Claude Code session tracking.
 
 Called by Claude Code's SessionStart hook to maintain a window↔session
-mapping in <CCBOT_DIR>/session_map.json, and by the Stop hook to drop a
-per-session marker file (consumed by the monitor to trigger TTS voice
-replies). Also provides `--install` to auto-configure both hooks in
-~/.claude/settings.json.
+mapping in <CCBOT_DIR>/session_map.json. Also provides `--install` to
+auto-configure the hook in ~/.claude/settings.json.
 
 This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
 since hooks run inside tmux panes where bot env vars are not set.
@@ -35,7 +33,7 @@ _CLAUDE_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 _HOOK_COMMAND_SUFFIX = "ccbot hook"
 
 # Hook events we handle; --install registers all of them
-_HOOK_EVENTS = ["SessionStart", "Stop"]
+_HOOK_EVENTS = ["SessionStart"]
 
 
 def _find_ccbot_path() -> str:
@@ -138,24 +136,6 @@ def _install_hook() -> int:
     return 0
 
 
-def _handle_stop(session_id: str) -> None:
-    """Drop a per-session marker file when Claude finishes a turn.
-
-    The session monitor consumes these markers to send the final reply
-    as a TTS voice message. session_id is UUID-validated by the caller,
-    so it is safe to use as a filename.
-    """
-    from .utils import stop_signals_dir
-
-    signals_dir = stop_signals_dir()
-    try:
-        signals_dir.mkdir(parents=True, exist_ok=True)
-        (signals_dir / session_id).touch()
-        logger.debug("Wrote stop signal for session %s", session_id)
-    except OSError as e:
-        logger.error("Failed to write stop signal: %s", e)
-
-
 def hook_main() -> None:
     """Process a Claude Code hook event from stdin, or install the hook."""
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
@@ -205,10 +185,6 @@ def hook_main() -> None:
     # Validate cwd is an absolute path (if provided)
     if cwd and not os.path.isabs(cwd):
         logger.warning("cwd is not absolute: %s", cwd)
-        return
-
-    if event == "Stop":
-        _handle_stop(session_id)
         return
 
     if event != "SessionStart":

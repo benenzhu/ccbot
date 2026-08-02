@@ -25,6 +25,7 @@ def mock_config():
         cfg.tts_model = "gpt-4o-mini-tts"
         cfg.tts_voice = ""
         cfg.tts_max_chars = 3000
+        cfg.tts_segment_chars = 180
         cfg.tts_speed = 1.0
         cfg.openai_api_key = "sk-test-key"
         cfg.openai_base_url = "https://api.openai.com/v1"
@@ -58,6 +59,87 @@ class TestPrepareTtsText:
 
     def test_all_code_yields_empty(self, mock_config):
         assert tts.prepare_tts_text("```\nonly code\n```") == ""
+
+
+class TestSplitForTts:
+    def test_short_text_stays_whole(self):
+        assert tts.split_for_tts("短句。", 180) == ["短句。"]
+
+    def test_empty_text_yields_nothing(self):
+        assert tts.split_for_tts("", 180) == []
+
+    def test_zero_limit_disables_splitting(self):
+        text = "一" * 500
+        assert tts.split_for_tts(text, 0) == [text]
+
+    def test_splits_on_cjk_terminators(self):
+        text = "第一句话在这里。第二句话也在这里！第三句话结束了？"
+        segments = tts.split_for_tts(text, 14)
+        assert segments == [
+            "第一句话在这里。",
+            "第二句话也在这里！",
+            "第三句话结束了？",
+        ]
+
+    def test_segments_respect_limit(self):
+        text = "这是一个句子。" * 40
+        segments = tts.split_for_tts(text, 60)
+        assert len(segments) > 1
+        assert all(len(s) <= 60 for s in segments)
+
+    def test_no_content_lost(self):
+        text = "克隆完成。这个架构新东西很多！我先读代码，再讲结构。"
+        assert "".join(tts.split_for_tts(text, 12)) == text
+
+    def test_cjk_joined_without_space(self):
+        text = "第一句。第二句。"
+        assert tts.split_for_tts(text, 180) == [text]
+
+    def test_ascii_sentences_keep_space(self):
+        text = "First one. Second one."
+        assert tts.split_for_tts(text, 180) == ["First one. Second one."]
+
+    def test_abbreviations_and_decimals_not_split(self):
+        text = "Version 3.5 is out, e.g. the new one. Next sentence here."
+        assert tts.split_for_tts(text, 40) == [
+            "Version 3.5 is out, e.g. the new one.",
+            "Next sentence here.",
+        ]
+
+    def test_runaway_sentence_hard_split(self):
+        text = "啊" * 500
+        segments = tts.split_for_tts(text, 180)
+        assert all(len(s) <= 180 for s in segments)
+        assert "".join(segments) == text
+
+    def test_hard_split_prefers_soft_punctuation(self):
+        text = "前面这段话相当长，后面这段话也不短，还有第三段内容在这里"
+        segments = tts.split_for_tts(text, 16)
+        assert all(len(s) <= 16 for s in segments)
+        assert segments[0].endswith("，")
+
+
+class TestPrepareTtsSegments:
+    def test_strips_then_splits(self, mock_config):
+        mock_config.tts_segment_chars = 10
+        text = "**第一句话在这里。**\n\n```python\ncode\n```\n\n第二句话在这里。"
+        assert tts.prepare_tts_segments(text) == [
+            "第一句话在这里。",
+            "第二句话在这里。",
+        ]
+
+    def test_short_reply_stays_one_segment(self, mock_config):
+        text = "**第一句话在这里。**\n\n第二句话在这里。"
+        assert len(tts.prepare_tts_segments(text)) == 1
+
+    def test_unspeakable_yields_empty_list(self, mock_config):
+        assert tts.prepare_tts_segments("```\nonly code\n```") == []
+
+    def test_respects_max_chars_before_splitting(self, mock_config):
+        mock_config.tts_max_chars = 10
+        mock_config.tts_segment_chars = 4
+        segments = tts.prepare_tts_segments("啊" * 100)
+        assert "".join(segments) == "啊" * 10
 
 
 class TestParseVolcanoStream:

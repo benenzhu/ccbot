@@ -1791,11 +1791,15 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         logger.info(f"No active users for session {msg.session_id}")
         return
 
-    # TTS voice reply of the final turn text — no parts/table processing
-    if msg.content_type == "tts":
-        for user_id, wid, thread_id in active_users:
-            await enqueue_voice_message(bot, user_id, wid, msg.text, thread_id)
-        return
+    # Assistant prose is read aloud; thinking and tool traffic are not.
+    # The voice task is enqueued right after the text so the same per-user
+    # FIFO queue delivers the bubble immediately below its message.
+    speak = (
+        config.tts_enabled
+        and msg.role == "assistant"
+        and msg.content_type == "text"
+        and bool(msg.text)
+    )
 
     for user_id, wid, thread_id in active_users:
         # Handle interactive tools specially - capture terminal and send UI
@@ -1884,6 +1888,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 thread_id=thread_id,
                 image_data=combined_images or None,
             )
+
+            if speak:
+                await enqueue_voice_message(bot, user_id, wid, msg.text, thread_id)
 
             # Update user's read offset to current file position
             # This marks these messages as "read" for this user

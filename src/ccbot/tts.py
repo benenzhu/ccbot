@@ -1,7 +1,7 @@
-"""Text-to-speech synthesis for reading Claude's final reply aloud.
+"""Text-to-speech synthesis for reading Claude's replies aloud.
 
-Converts the final assistant message of each turn into an OGG/Opus voice
-clip (the format Telegram voice bubbles require — no ffmpeg needed).
+Converts an assistant message into one or more OGG/Opus voice clips (the
+format Telegram voice bubbles require — no ffmpeg needed).
 Providers, selected via CCBOT_TTS_PROVIDER:
   - "openai": POST /audio/speech (gpt-4o-mini-tts), response_format=opus
   - "azure": Azure Speech REST API, ogg-48khz-16bit-mono-opus output
@@ -9,9 +9,15 @@ Providers, selected via CCBOT_TTS_PROVIDER:
     (NDJSON response; base64 audio chunks are joined into one stream)
 
 Markdown is stripped before synthesis (code blocks dropped entirely) and
-input is capped at config.tts_max_chars.
+input is capped at config.tts_max_chars. Long replies are split at
+sentence boundaries into config.tts_segment_chars-sized segments so the
+caller can synthesize and deliver them incrementally — the first voice
+bubble then arrives after one short segment instead of the whole reply.
 
-Key function: synthesize_speech(text) -> bytes (OGG/Opus)
+Key functions:
+  - prepare_tts_segments(text) -> list[str] (speakable, split for latency)
+  - synthesize_prepared(segment) -> bytes (OGG/Opus, no re-stripping)
+  - synthesize_speech(text) -> bytes (strip + synthesize in one call)
 """
 
 import base64
@@ -42,7 +48,7 @@ _AZURE_DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 # 2.0 voices carry the _uranus_bigtts suffix and pair with seed-tts-2.0;
 # 1.0 voices (_moon_bigtts etc.) need VOLCANO_TTS_RESOURCE_ID=seed-tts-1.0
 _VOLCANO_DEFAULT_VOICE = "zh_female_vv_uranus_bigtts"
-_VOLCANO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+_VOLCANO_TTS_URL = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
 # Terminal code marking the end of the volcano NDJSON stream
 _VOLCANO_STREAM_END = 20000000
 
@@ -53,6 +59,18 @@ _HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _EMPHASIS_RE = re.compile(r"(\*{1,3}|_{1,3}|~~)(?=\S)(.+?)(?<=\S)\1", re.DOTALL)
 _QUOTE_PREFIX_RE = re.compile(r"^\s{0,3}>\s?", re.MULTILINE)
 _LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", re.MULTILINE)
+
+# Sentence-ish boundaries for segmenting long replies. CJK terminators
+# stand alone (Chinese text has no space after 。), while ASCII ones need
+# trailing whitespace so "e.g." and "3.5" stay intact. A newline is also a
+# break, so list items and paragraphs never straddle segments.
+_SENTENCE_SPLIT_RE = re.compile(
+    r"""(?<=[。！？；…])              # CJK terminator — no space needed
+      | (?<=[.!?;])(?=\s)             # ASCII terminator + whitespace
+      | \n+                           # line / paragraph break
+    """,
+    re.VERBOSE,
+)
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -81,6 +99,95 @@ def prepare_tts_text(text: str) -> str:
     text = _LIST_MARKER_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text[: config.tts_max_chars]
+
+
+def _hard_split(chunk: str, limit: int) -> list[str]:
+    """Split an over-long sentence that has no usable boundary.
+
+    Prefers commas and other soft punctuation, falling back to a blunt
+    character slice so a single runaway sentence can never exceed limit.
+    """
+    pieces: list[str] = []
+    rest = chunk
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = max(
+            window.rfind("，"),
+            window.rfind("、"),
+            window.rfind(","),
+            window.rfind("："),
+            window.rfind(":"),
+            window.rfind(" "),
+        )
+        # Ignore a boundary so early that segments would be lopsided
+        if cut < limit // 2:
+            cut = limit - 1
+        pieces.append(rest[: cut + 1].strip())
+        rest = rest[cut + 1 :].lstrip()
+    if rest:
+        pieces.append(rest)
+    return [p for p in pieces if p]
+
+
+def _join_chunks(left: str, right: str) -> str:
+    """Concatenate two sentences, spacing them only if either side is ASCII.
+
+    CJK text needs no separator after 。/！/？, but English sentences do.
+    """
+    if not left:
+        return right
+    sep = "" if _is_cjk(left[-1]) and _is_cjk(right[0]) else " "
+    return f"{left}{sep}{right}"
+
+
+def _is_cjk(char: str) -> bool:
+    """True for CJK ideographs and CJK punctuation."""
+    return "　" <= char <= "鿿" or "＀" <= char <= "￯"
+
+
+def split_for_tts(text: str, limit: int) -> list[str]:
+    """Pack speakable text into segments of at most `limit` characters.
+
+    Splits on sentence boundaries and greedily fills each segment, so
+    segments stay whole-sentence wherever the text allows. A limit of 0
+    or less disables splitting.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return [text] if text else []
+
+    segments: list[str] = []
+    current = ""
+    for chunk in _SENTENCE_SPLIT_RE.split(text):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if len(chunk) > limit:
+            # Flush what we have, then break the oversized sentence apart
+            if current:
+                segments.append(current)
+                current = ""
+            segments.extend(_hard_split(chunk, limit))
+            continue
+        candidate = _join_chunks(current, chunk)
+        if len(candidate) > limit:
+            segments.append(current)
+            current = chunk
+        else:
+            current = candidate
+    if current:
+        segments.append(current)
+    return segments
+
+
+def prepare_tts_segments(text: str) -> list[str]:
+    """Strip markdown, then split into synthesis-sized segments.
+
+    Returns an empty list when nothing speakable remains.
+    """
+    speakable = prepare_tts_text(text)
+    if not speakable:
+        return []
+    return split_for_tts(speakable, config.tts_segment_chars)
 
 
 async def _synthesize_openai(text: str) -> bytes:
@@ -190,16 +297,17 @@ async def _synthesize_volcano(text: str) -> bytes:
     return _parse_volcano_stream(response.text)
 
 
-async def synthesize_speech(text: str) -> bytes:
-    """Convert text to an OGG/Opus voice clip via the configured provider.
+async def synthesize_prepared(speakable: str) -> bytes:
+    """Synthesize already-stripped text via the configured provider.
+
+    Use with prepare_tts_segments(), which does the stripping once for
+    the whole reply before splitting it.
 
     Raises:
-        ValueError: If nothing speakable remains after markdown stripping
-            (permanent — do not retry).
+        ValueError: If the text is empty (permanent — do not retry).
         TtsApiError: If the provider returns an error or empty audio.
         httpx.HTTPStatusError: On HTTP-level API errors (401, 429, 5xx).
     """
-    speakable = prepare_tts_text(text)
     if not speakable:
         raise ValueError("No speakable text after stripping markdown")
 
@@ -213,6 +321,18 @@ async def synthesize_speech(text: str) -> bytes:
     if not audio:
         raise TtsApiError("Empty audio returned by TTS API")
     return audio
+
+
+async def synthesize_speech(text: str) -> bytes:
+    """Convert text to a single OGG/Opus voice clip (strip + synthesize).
+
+    Raises:
+        ValueError: If nothing speakable remains after markdown stripping
+            (permanent — do not retry).
+        TtsApiError: If the provider returns an error or empty audio.
+        httpx.HTTPStatusError: On HTTP-level API errors (401, 429, 5xx).
+    """
+    return await synthesize_prepared(prepare_tts_text(text))
 
 
 async def close_client() -> None:
