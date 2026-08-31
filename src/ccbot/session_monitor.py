@@ -49,6 +49,7 @@ class NewMessage:
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    is_replay: bool = False  # True when replaying past history (e.g. --resume)
 
 
 class SessionMonitor:
@@ -84,6 +85,13 @@ class SessionMonitor:
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
+        # Sessions whose offset was rewound to replay old history. Messages
+        # read from these are flagged is_replay until the offset reaches EOF.
+        self._replay_sessions: set[str] = set()
+
+    def mark_replay(self, session_id: str) -> None:
+        """Flag a session as replaying history (suppresses TTS downstream)."""
+        self._replay_sessions.add(session_id)
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -322,6 +330,10 @@ class SessionMonitor:
                     # File hasn't changed, skip reading
                     continue
 
+                # Replay state is captured before the read: everything in this
+                # batch is old history, so it must not be spoken aloud.
+                is_replay = session_info.session_id in self._replay_sessions
+
                 # File changed, read new content from last offset
                 new_entries = await self._read_new_lines(
                     tracked, session_info.file_path
@@ -361,8 +373,14 @@ class SessionMonitor:
                             role=entry.role,
                             tool_name=entry.tool_name,
                             image_data=entry.image_data,
+                            is_replay=is_replay,
                         )
                     )
+
+                # Replay ends once we've caught up with the file; a long
+                # history may take several cycles (partial lines, growth).
+                if is_replay and tracked.last_byte_offset >= current_size:
+                    self._replay_sessions.discard(session_info.session_id)
 
                 self.state.update_session(tracked)
 

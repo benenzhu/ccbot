@@ -1028,6 +1028,9 @@ async def _create_and_bind_window(
         )
         session_monitor.state.save()
         session_monitor._file_mtimes.pop(resume_session_id, None)
+        # Replayed history is text-only — no TTS, it would burn quota on
+        # messages the user already has.
+        session_monitor.mark_replay(resume_session_id)
         logger.info(
             "Pre-seeded monitor offset=0 for resumed session %s (path=%s)",
             resume_session_id,
@@ -1796,6 +1799,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     # FIFO queue delivers the bubble immediately below its message.
     speak = (
         config.tts_enabled
+        and not msg.is_replay
         and msg.role == "assistant"
         and msg.content_type == "text"
         and bool(msg.text)
