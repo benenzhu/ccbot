@@ -56,3 +56,38 @@ class TestConvertMarkdown:
         assert ">inside quote||" in result
         assert "before" in result
         assert "after" in result
+
+
+class TestTableToMarkdown:
+    """table_to_markdown serializes (headers, rows) back to pipe syntax."""
+
+    def test_basic_table(self):
+        from ccbot.markdown_v2 import table_to_markdown
+
+        md = table_to_markdown((["Name", "Value"], [["a", "1"], ["b", "2"]]))
+        assert md.split("\n") == [
+            "| Name | Value |",
+            "|---|---|",
+            "| a | 1 |",
+            "| b | 2 |",
+        ]
+
+    def test_escapes_pipes_and_pads_ragged_rows(self):
+        from ccbot.markdown_v2 import table_to_markdown
+
+        md = table_to_markdown((["h1", "h2", "h3"], [["x|y"], ["1", "2", "3", "4"]]))
+        lines = md.split("\n")
+        assert lines[0] == "| h1 | h2 | h3 |  |"
+        assert lines[1] == "|---|---|---|---|"
+        assert lines[2] == "| x\\|y |  |  |  |"
+        assert lines[3] == "| 1 | 2 | 3 | 4 |"
+
+    def test_roundtrip_through_extractor(self):
+        from ccbot.markdown_v2 import extract_markdown_tables, table_to_markdown
+
+        src = "intro\n\n| A | B |\n|---|---|\n| **1** | `x` |\n\nend"
+        stripped, tables = extract_markdown_tables(src)
+        assert "| A |" not in stripped
+        assert len(tables) == 1
+        _, again = extract_markdown_tables(table_to_markdown(tables[0]))
+        assert again == tables

@@ -30,6 +30,7 @@ from .callback_data import (
     CB_DIR_UP,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
+    CB_SESSION_REPLAY,
     CB_SESSION_SELECT,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
@@ -49,6 +50,7 @@ BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+REPLAY_KEY = "resume_replay"  # bool: replay history on resume
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -72,6 +74,7 @@ def clear_session_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(SESSIONS_KEY, None)
+        user_data.pop(REPLAY_KEY, None)
 
 
 def build_window_picker(
@@ -214,11 +217,14 @@ def _relative_time(file_path: str) -> str:
 
 def build_session_picker(
     sessions: list[ClaudeSession],
+    replay_history: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build session picker UI for resuming an existing Claude session.
 
     Args:
         sessions: List of ClaudeSession objects (sorted by recency).
+        replay_history: Current state of the "replay history" toggle. When
+            True, resuming replays the whole transcript into the topic.
 
     Returns: (text, keyboard).
     """
@@ -244,6 +250,16 @@ def build_session_picker(
                 )
             )
         buttons.append(row)
+
+    if replay_history:
+        lines.append("\nHistory: *replayed* into this topic on resume.")
+        toggle_label = "📜 Replay history: ON"
+    else:
+        lines.append("\nHistory: *not replayed*; only new output is forwarded.")
+        toggle_label = "📜 Replay history: OFF"
+    buttons.append(
+        [InlineKeyboardButton(toggle_label, callback_data=CB_SESSION_REPLAY)]
+    )
 
     buttons.append(
         [

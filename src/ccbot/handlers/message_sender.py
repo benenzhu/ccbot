@@ -8,6 +8,7 @@ Uses telegramify-markdown for MarkdownV2 formatting.
 Functions:
   - send_with_fallback: Send with formatting → plain text fallback
   - send_photo: Photo sending (single or media group)
+  - send_rich_markdown: Bot API 10.1 sendRichMessage (native tables etc.)
   - safe_reply: Reply with formatting, fallback to plain text
   - safe_edit: Edit message with formatting, fallback to plain text
   - safe_send: Send message with formatting, fallback to plain text
@@ -124,6 +125,36 @@ async def send_photo(
         raise
     except Exception as e:
         logger.error("Failed to send photo to %d: %s", chat_id, e)
+
+
+async def send_rich_markdown(
+    bot: Bot,
+    chat_id: int,
+    markdown: str,
+    **kwargs: Any,
+) -> bool:
+    """Send a rich message (Bot API 10.1) from rich-Markdown source.
+
+    python-telegram-bot has no wrapper for sendRichMessage yet, so this goes
+    through Bot.do_api_request, which still passes ExtBot's rate limiter.
+    Rich Markdown is GitHub-flavored: pipe tables render as native tables.
+
+    Returns True on success, False on any non-rate-limit failure.
+    RetryAfter is re-raised for caller handling.
+    """
+    api_kwargs: dict[str, Any] = {
+        "chat_id": chat_id,
+        "rich_message": {"markdown": markdown},
+        **kwargs,
+    }
+    try:
+        await bot.do_api_request("sendRichMessage", api_kwargs=api_kwargs)
+        return True
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.warning("Failed to send rich message to %d: %s", chat_id, e)
+        return False
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Message:

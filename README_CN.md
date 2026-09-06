@@ -92,6 +92,7 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_COMMAND` | `claude` | 新窗口中运行的命令 |
 | `MONITOR_POLL_INTERVAL` | `2.0` | 轮询间隔（秒） |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | 在目录浏览器中显示隐藏（点开头）目录 |
+| `CCBOT_RESUME_REPLAY` | `true` | 会话选择器里"回放历史"开关的默认值：恢复会话时是否把完整历史回放到 topic，关闭则只转发恢复之后的新输出 |
 | `OPENAI_API_KEY` | _(无)_ | OpenAI API 密钥，用于语音消息转录 |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API 基础 URL（用于代理或兼容 API） |
 

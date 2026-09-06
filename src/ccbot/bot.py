@@ -78,6 +78,7 @@ from .handlers.callback_data import (
     CB_HISTORY_PREV,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
+    CB_SESSION_REPLAY,
     CB_SESSION_SELECT,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
@@ -89,6 +90,7 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    REPLAY_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
@@ -128,11 +130,11 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
-from .markdown_v2 import convert_markdown, extract_markdown_tables
+from .markdown_v2 import ParsedTable, convert_markdown, extract_markdown_tables
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .monitor_state import TrackedSession
-from .screenshot import render_table_image, text_to_image
+from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
@@ -1002,14 +1004,19 @@ async def _create_and_bind_window(
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
     resume_file_path: str | None = None,
+    replay_history: bool = True,
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
     Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
 
-    On resume, pre-seeds the monitor's byte offset to 0 so the next poll cycle
-    replays the entire JSONL history to Telegram, and discards any pending text
-    so the user can review history before sending new messages.
+    On resume with replay_history=True, pre-seeds the monitor's byte offset to
+    0 so the next poll cycle replays the entire JSONL history to Telegram, and
+    discards any pending text so the user can review history first.
+
+    On resume with replay_history=False, pre-seeds the offset to the current
+    file size so only output produced after the resume is forwarded, and the
+    pending text is sent like a fresh session.
     """
     from telegram import CallbackQuery, User
 
@@ -1024,25 +1031,38 @@ async def _create_and_bind_window(
     except BadRequest as e:
         logger.debug("Callback answer failed (already expired?): %s", e)
 
-    # Pre-seed monitor offset BEFORE the window starts so the very first poll
-    # cycle reads the JSONL from byte 0 and replays history into Telegram.
-    # Done before window creation to avoid a race with the 2s poll loop.
+    # Pre-seed monitor offset BEFORE the window starts. Done before window
+    # creation to avoid a race with the 2s poll loop.
+    #   replay: offset=0 so the very first poll cycle reads the JSONL from
+    #           byte 0 and replays history into Telegram.
+    #   no replay: offset=EOF so a stale tracked offset from an earlier bind
+    #              can't leak old messages; only new output is forwarded.
     if resume_session_id and resume_file_path and session_monitor is not None:
+        if replay_history:
+            seed_offset = 0
+        else:
+            try:
+                seed_offset = Path(resume_file_path).stat().st_size
+            except OSError:
+                seed_offset = 0
         session_monitor.state.update_session(
             TrackedSession(
                 session_id=resume_session_id,
                 file_path=resume_file_path,
-                last_byte_offset=0,
+                last_byte_offset=seed_offset,
             )
         )
         session_monitor.state.save()
         session_monitor._file_mtimes.pop(resume_session_id, None)
-        # Replayed history is text-only — no TTS, it would burn quota on
-        # messages the user already has.
-        session_monitor.mark_replay(resume_session_id)
+        if replay_history:
+            # Replayed history is text-only — no TTS, it would burn quota on
+            # messages the user already has.
+            session_monitor.mark_replay(resume_session_id)
         logger.info(
-            "Pre-seeded monitor offset=0 for resumed session %s (path=%s)",
+            "Pre-seeded monitor offset=%d for resumed session %s (replay=%s, path=%s)",
+            seed_offset,
             resume_session_id,
+            replay_history,
             resume_file_path,
         )
 
@@ -1119,9 +1139,9 @@ async def _create_and_bind_window(
                 session_manager._save_state()
 
         if pending_thread_id is not None:
-            if resume_session_id:
-                # Resume: discard any pending text so the user can review the
-                # replayed history first and then decide what to send next.
+            if resume_session_id and replay_history:
+                # Resume with replay: discard any pending text so the user can
+                # review the replayed history first and then decide what to send.
                 discarded = (
                     context.user_data.pop("_pending_thread_text", None)
                     if context.user_data
@@ -1143,10 +1163,12 @@ async def _create_and_bind_window(
                     f"✅ {message}\n\nResumed.{note}",
                 )
             else:
-                await safe_edit(
-                    query,
-                    f"✅ {message}\n\nCreated. Send messages here.",
+                done_note = (
+                    "Resumed without history replay. Send messages here."
+                    if resume_session_id
+                    else "Created. Send messages here."
                 )
+                await safe_edit(query, f"✅ {message}\n\n{done_note}")
                 # Send pending text if any
                 pending_text = (
                     context.user_data.get("_pending_thread_text")
@@ -1384,7 +1406,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
                 context.user_data[SESSIONS_KEY] = sessions
                 context.user_data["_selected_path"] = selected_path
-            text, keyboard = build_session_picker(sessions)
+                context.user_data[REPLAY_KEY] = config.resume_replay_history
+            text, keyboard = build_session_picker(
+                sessions, replay_history=config.resume_replay_history
+            )
             await safe_edit(query, text, reply_markup=keyboard)
             await query.answer()
             return
@@ -1439,6 +1464,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if context.user_data
             else str(Path.cwd())
         )
+        replay_history = bool(
+            context.user_data.get(REPLAY_KEY, config.resume_replay_history)
+            if context.user_data
+            else config.resume_replay_history
+        )
         clear_session_picker_state(context.user_data)
         if context.user_data is not None:
             context.user_data.pop("_selected_path", None)
@@ -1451,6 +1481,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pending_tid,
             resume_session_id=session.session_id,
             resume_file_path=session.file_path,
+            replay_history=replay_history,
+        )
+
+    # Session picker: flip the "replay history" toggle and redraw
+    elif data == CB_SESSION_REPLAY:
+        pending_tid = (
+            context.user_data.get("_pending_thread_id") if context.user_data else None
+        )
+        if pending_tid is not None and _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        cached_sessions = (
+            context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
+        )
+        if not cached_sessions or context.user_data is None:
+            await query.answer("Picker expired, please retry", show_alert=True)
+            return
+        replay_history = not context.user_data.get(
+            REPLAY_KEY, config.resume_replay_history
+        )
+        context.user_data[REPLAY_KEY] = replay_history
+        text, keyboard = build_session_picker(
+            cached_sessions, replay_history=replay_history
+        )
+        await safe_edit(query, text, reply_markup=keyboard)
+        await query.answer(
+            "History will be replayed" if replay_history else "History replay off"
         )
 
     elif data == CB_SESSION_NEW:
@@ -1852,31 +1909,16 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         ):
             continue
 
-        # Extract markdown tables and render them as PNG images so Telegram
-        # users see real tables instead of card-style text. Only complete
-        # messages get this treatment — partial streams may have unfinished
-        # table syntax.
+        # Strip markdown tables out of the text; the queue worker sends them
+        # after the message as native Telegram tables (Bot API 10.1), with a
+        # PNG fallback. Only complete messages get this treatment — partial
+        # streams may have unfinished table syntax.
         text_for_parts = msg.text
-        table_images: list[tuple[str, bytes]] = []
+        tables: list[ParsedTable] = []
         if msg.is_complete and msg.content_type != "thinking":
             stripped, tables = extract_markdown_tables(msg.text)
             if tables:
                 text_for_parts = stripped
-                for idx, (headers, rows) in enumerate(tables):
-                    try:
-                        png = await render_table_image(headers, rows)
-                        table_images.append((f"table_{idx + 1}.png", png))
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to render table %d as image: %s; "
-                            "falling back to inline text",
-                            idx + 1,
-                            e,
-                        )
-                        # Fallback: keep the table inline as card-style text
-                        text_for_parts = msg.text
-                        table_images = []
-                        break
 
         parts = build_response_parts(
             text_for_parts,
@@ -1886,9 +1928,6 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         )
 
         if msg.is_complete:
-            # Combine message-attached images (tool_result base64) with
-            # any table images we just rendered.
-            combined_images = list(msg.image_data or []) + table_images
             await enqueue_content_message(
                 bot=bot,
                 user_id=user_id,
@@ -1898,7 +1937,8 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 content_type=msg.content_type,
                 text=msg.text,
                 thread_id=thread_id,
-                image_data=combined_images or None,
+                image_data=list(msg.image_data) if msg.image_data else None,
+                tables=tables or None,
             )
 
             if speak:

@@ -172,3 +172,102 @@ async def test_voice_prefetch_overlaps_synthesis():
     assert bot.send_voice.call_count == len(segments)
     # Serial synthesis alone would cost len(segments) * delay
     assert elapsed < len(segments) * delay
+
+
+# --- Table attachments: native rich message with PNG fallback ---
+
+
+def _table_task() -> MessageTask:
+    return MessageTask(
+        task_type="content",
+        window_id="@1",
+        thread_id=42,
+        parts=["text"],
+        tables=[(["h"], [["v"]])],
+    )
+
+
+async def test_tables_sent_natively_when_rich_send_succeeds():
+    bot = AsyncMock()
+    with (
+        patch.object(message_queue.config, "native_tables", True),
+        patch.object(
+            message_queue, "send_rich_markdown", AsyncMock(return_value=True)
+        ) as rich,
+        patch.object(message_queue, "send_photo", AsyncMock()) as photo,
+        patch.object(message_queue, "render_table_image", AsyncMock()) as render,
+    ):
+        await message_queue._send_task_tables(bot, 777, _table_task())
+
+    rich.assert_awaited_once()
+    args, kwargs = rich.await_args
+    assert args[:2] == (bot, 777)
+    assert args[2].startswith("| h |")
+    assert kwargs == {"message_thread_id": 42}
+    render.assert_not_awaited()
+    photo.assert_not_awaited()
+
+
+async def test_tables_fall_back_to_png_when_rich_send_fails():
+    bot = AsyncMock()
+    with (
+        patch.object(message_queue.config, "native_tables", True),
+        patch.object(
+            message_queue, "send_rich_markdown", AsyncMock(return_value=False)
+        ),
+        patch.object(message_queue, "send_photo", AsyncMock()) as photo,
+        patch.object(
+            message_queue, "render_table_image", AsyncMock(return_value=b"png")
+        ) as render,
+    ):
+        await message_queue._send_task_tables(bot, 777, _table_task())
+
+    render.assert_awaited_once_with(["h"], [["v"]])
+    photo.assert_awaited_once()
+    args, kwargs = photo.await_args
+    assert args[:2] == (bot, 777)
+    assert args[2] == [("table.png", b"png")]
+    assert kwargs == {"message_thread_id": 42}
+
+
+async def test_tables_go_straight_to_png_when_native_disabled():
+    bot = AsyncMock()
+    with (
+        patch.object(message_queue.config, "native_tables", False),
+        patch.object(message_queue, "send_rich_markdown", AsyncMock()) as rich,
+        patch.object(message_queue, "send_photo", AsyncMock()) as photo,
+        patch.object(
+            message_queue, "render_table_image", AsyncMock(return_value=b"png")
+        ),
+    ):
+        await message_queue._send_task_tables(bot, 777, _table_task())
+
+    rich.assert_not_awaited()
+    photo.assert_awaited_once()
+
+
+async def test_merge_carries_tables_and_images_from_all_tasks():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    first = MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["a"],
+        image_data=[("img", b"1")],
+    )
+    second = MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["b"],
+        tables=[(["h"], [["v"]])],
+        image_data=[("img", b"2")],
+    )
+    queue.put_nowait(second)
+
+    merged, count = await message_queue._merge_content_tasks(
+        queue, first, asyncio.Lock()
+    )
+
+    assert count == 1
+    assert merged.parts == ["a", "b"]
+    assert merged.image_data == [("img", b"1"), ("img", b"2")]
+    assert merged.tables == [(["h"], [["v"]])]

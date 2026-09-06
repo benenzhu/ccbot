@@ -46,6 +46,7 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
+CB_SESSION_REPLAY = "rs:replay"  # toggle history replay on/off
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>

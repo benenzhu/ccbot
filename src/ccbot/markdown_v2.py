@@ -112,6 +112,28 @@ def extract_markdown_tables(text: str) -> tuple[str, list[ParsedTable]]:
     return "\n".join(out), tables
 
 
+def table_to_markdown(table: ParsedTable) -> str:
+    """Serialize a parsed table back to GitHub-flavored pipe syntax.
+
+    Used to send tables through Telegram's rich message API, whose Markdown
+    mode renders pipe tables natively. Pipes inside cells are escaped and
+    ragged rows are padded so every row has the header's column count.
+    """
+    headers, rows = table
+    width = max([len(headers)] + [len(r) for r in rows]) if headers else 0
+
+    def cell(s: str) -> str:
+        return s.replace("|", "\\|").replace("\n", " ").strip()
+
+    def row(cells: list[str]) -> str:
+        padded = list(cells) + [""] * (width - len(cells))
+        return "| " + " | ".join(cell(c) for c in padded) + " |"
+
+    lines = [row(headers), "|" + "---|" * width]
+    lines.extend(row(r) for r in rows)
+    return "\n".join(lines)
+
+
 def convert_markdown_tables(text: str) -> str:
     """Convert markdown tables to card-style key-value format.
 

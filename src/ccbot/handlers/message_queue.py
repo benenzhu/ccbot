@@ -27,7 +27,9 @@ from telegram import Bot
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 
-from ..markdown_v2 import convert_markdown
+from ..config import config
+from ..markdown_v2 import ParsedTable, convert_markdown, table_to_markdown
+from ..screenshot import render_table_image
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
 from ..tmux_manager import tmux_manager
@@ -36,6 +38,7 @@ from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
     send_photo,
+    send_rich_markdown,
     send_with_fallback,
     strip_sentinels,
 )
@@ -65,6 +68,9 @@ class MessageTask:
     content_type: str = "text"
     thread_id: int | None = None  # Telegram topic thread_id for targeted send
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
+    # Markdown tables stripped from the text, sent after it as native
+    # Telegram tables (PNG fallback). Each is (headers, rows).
+    tables: list[ParsedTable] | None = None
 
 
 # Per-user message queues and worker tasks
@@ -151,6 +157,8 @@ async def _merge_content_tasks(
         Without this compensation, queue.join() would wait indefinitely.
     """
     merged_parts = list(first.parts)
+    merged_images: list[tuple[str, bytes]] = list(first.image_data or [])
+    merged_tables: list[ParsedTable] = list(first.tables or [])
     current_length = sum(len(p) for p in merged_parts)
     merge_count = 0
 
@@ -172,6 +180,8 @@ async def _merge_content_tasks(
                 break
 
             merged_parts.extend(task.parts)
+            merged_images.extend(task.image_data or [])
+            merged_tables.extend(task.tables or [])
             current_length += task_length
             merge_count += 1
 
@@ -193,6 +203,8 @@ async def _merge_content_tasks(
             tool_use_id=first.tool_use_id,
             content_type=first.content_type,
             thread_id=first.thread_id,
+            image_data=merged_images or None,
+            tables=merged_tables or None,
         ),
         merge_count,
     )
@@ -300,6 +312,57 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
     )
 
 
+async def _send_table_as_image(
+    bot: Bot, chat_id: int, table: ParsedTable, thread_id: int | None
+) -> None:
+    """PNG fallback for a single table."""
+    headers, rows = table
+    try:
+        png = await render_table_image(headers, rows)
+    except Exception as e:
+        logger.warning("Failed to render table as image: %s", e)
+        return
+    await send_photo(
+        bot,
+        chat_id,
+        [("table.png", png)],
+        **_send_kwargs(thread_id),  # type: ignore[arg-type]
+    )
+
+
+async def _send_task_tables(bot: Bot, chat_id: int, task: MessageTask) -> None:
+    """Send tables attached to a task as native rich-message tables.
+
+    Falls back to a PNG rendering per table when native tables are disabled
+    or the sendRichMessage call fails (old client, API error).
+    """
+    if not task.tables:
+        return
+    logger.info(
+        "Sending %d table(s) in thread %s (native=%s)",
+        len(task.tables),
+        task.thread_id,
+        config.native_tables,
+    )
+    for table in task.tables:
+        if config.native_tables:
+            ok = await send_rich_markdown(
+                bot,
+                chat_id,
+                table_to_markdown(table),
+                **_send_kwargs(task.thread_id),
+            )
+            if ok:
+                continue
+        await _send_table_as_image(bot, chat_id, table, task.thread_id)
+
+
+async def _send_task_attachments(bot: Bot, chat_id: int, task: MessageTask) -> None:
+    """Send everything that follows a task's text: tables, then images."""
+    await _send_task_tables(bot, chat_id, task)
+    await _send_task_images(bot, chat_id, task)
+
+
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
     """Process a content message task."""
     wid = task.window_id or ""
@@ -323,7 +386,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                await _send_task_images(bot, chat_id, task)
+                await _send_task_attachments(bot, chat_id, task)
                 await _check_and_send_status(bot, user_id, wid, task.thread_id)
                 return
             except RetryAfter:
@@ -338,7 +401,7 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
                         text=plain_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    await _send_task_images(bot, chat_id, task)
+                    await _send_task_attachments(bot, chat_id, task)
                     await _check_and_send_status(bot, user_id, wid, task.thread_id)
                     return
                 except RetryAfter:
@@ -381,8 +444,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
 
-    # 4. Send images if present (from tool_result with base64 image blocks)
-    await _send_task_images(bot, chat_id, task)
+    # 4. Send attachments: tables (native, PNG fallback), then images
+    await _send_task_attachments(bot, chat_id, task)
 
     # 5. After content, check and send status
     await _check_and_send_status(bot, user_id, wid, task.thread_id)
@@ -682,6 +745,7 @@ async def enqueue_content_message(
     text: str | None = None,
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
+    tables: list[ParsedTable] | None = None,
 ) -> None:
     """Enqueue a content message task."""
     logger.debug(
@@ -701,6 +765,7 @@ async def enqueue_content_message(
         content_type=content_type,
         thread_id=thread_id,
         image_data=image_data,
+        tables=tables,
     )
     queue.put_nowait(task)
 

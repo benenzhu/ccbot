@@ -108,6 +108,19 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Send markdown tables as native Telegram tables (Bot API 10.1
+        # sendRichMessage). When False, or when the API call fails, tables
+        # are rendered to PNG images instead.
+        self.native_tables = os.getenv("CCBOT_NATIVE_TABLES", "true").lower() != "false"
+
+        # Default for the "replay history" toggle in the session picker.
+        # When True, resuming a session replays its full JSONL history into
+        # the topic; when False, only new output after resume is forwarded.
+        # The user can flip it per resume via the picker button.
+        self.resume_replay_history = (
+            os.getenv("CCBOT_RESUME_REPLAY", "true").lower() != "false"
+        )
+
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.openai_base_url: str = os.getenv(
