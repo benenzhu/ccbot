@@ -47,6 +47,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -1015,6 +1016,14 @@ async def _create_and_bind_window(
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
 
+    # Acknowledge the tap right away. Callback query IDs expire after a few
+    # seconds, and this function waits up to 15s for the SessionStart hook;
+    # answering at the end raised "Query is too old".
+    try:
+        await query.answer("Creating window…")
+    except BadRequest as e:
+        logger.debug("Callback answer failed (already expired?): %s", e)
+
     # Pre-seed monitor offset BEFORE the window starts so the very first poll
     # cycle reads the JSONL from byte 0 and replays history into Telegram.
     # Done before window creation to avoid a race with the 2s poll loop.
@@ -1175,7 +1184,6 @@ async def _create_and_bind_window(
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
             context.user_data.pop("_pending_thread_text", None)
-    await query.answer("Created" if success else "Failed")
 
 
 # --- Callback query handler ---

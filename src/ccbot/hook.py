@@ -81,9 +81,36 @@ def _is_hook_installed(settings: dict, event: str) -> bool:
     return False
 
 
+def _repair_stale_hooks(settings: dict, hook_command: str) -> list[str]:
+    """Rewrite ccbot hook entries whose executable no longer exists.
+
+    A hook installed as '/old/path/ccbot hook' silently stops writing
+    session_map.json once that binary moves (pip reinstall, new venv), and
+    the bot then never sees any session. Returns the stale commands replaced.
+    """
+    repaired: list[str] = []
+    for event in _HOOK_EVENTS:
+        for entry in settings.get("hooks", {}).get(event, []):
+            if not isinstance(entry, dict):
+                continue
+            for h in entry.get("hooks", []):
+                if not isinstance(h, dict):
+                    continue
+                cmd = h.get("command", "")
+                if not cmd.endswith("/" + _HOOK_COMMAND_SUFFIX):
+                    continue
+                exe = cmd[: -len(" hook")]
+                if Path(exe).exists() or cmd == hook_command:
+                    continue
+                h["command"] = hook_command
+                repaired.append(cmd)
+    return repaired
+
+
 def _install_hook() -> int:
     """Install the ccbot hook into Claude's settings.json.
 
+    Also repairs an existing entry whose ccbot executable path is gone.
     Returns 0 on success, 1 on error.
     """
     settings_file = _CLAUDE_SETTINGS_FILE
@@ -99,20 +126,28 @@ def _install_hook() -> int:
             print(f"Error reading {settings_file}: {e}", file=sys.stderr)
             return 1
 
+    # Find the full path to ccbot
+    ccbot_path = _find_ccbot_path()
+    hook_command = f"{ccbot_path} hook"
+
+    # Repair entries pointing at a ccbot binary that no longer exists
+    repaired = _repair_stale_hooks(settings, hook_command)
+    for old_cmd in repaired:
+        logger.info("Repaired stale hook command: %s -> %s", old_cmd, hook_command)
+        print(f"Repaired stale hook: {old_cmd} -> {hook_command}")
+
     # Install for each event not yet configured
     missing_events = [e for e in _HOOK_EVENTS if not _is_hook_installed(settings, e)]
-    if not missing_events:
+    if not missing_events and not repaired:
         logger.info("Hook already installed in %s", settings_file)
         print(f"Hook already installed in {settings_file}")
         return 0
 
-    # Find the full path to ccbot
-    ccbot_path = _find_ccbot_path()
-    hook_command = f"{ccbot_path} hook"
     hook_config = {"type": "command", "command": hook_command, "timeout": 5}
-    logger.info(
-        "Installing hook command: %s (events: %s)", hook_command, missing_events
-    )
+    if missing_events:
+        logger.info(
+            "Installing hook command: %s (events: %s)", hook_command, missing_events
+        )
 
     if "hooks" not in settings:
         settings["hooks"] = {}
