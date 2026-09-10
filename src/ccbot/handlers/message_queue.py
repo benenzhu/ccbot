@@ -59,7 +59,7 @@ MERGE_MAX_LENGTH = 3800  # Leave room for markdown conversion overhead
 class MessageTask:
     """Message task for queue processing."""
 
-    task_type: Literal["content", "status_update", "status_clear", "voice"]
+    task_type: Literal["content", "status_update", "status_clear", "voice", "table"]
     text: str | None = None
     window_id: str | None = None
     # content type fields
@@ -256,6 +256,8 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
                 elif task.task_type == "voice":
                     await _process_voice_task(bot, user_id, task)
+                elif task.task_type == "table":
+                    await _process_table_task(bot, user_id, task)
             except RetryAfter as e:
                 retry_secs = (
                     e.retry_after
@@ -355,6 +357,17 @@ async def _send_task_tables(bot: Bot, chat_id: int, task: MessageTask) -> None:
             if ok:
                 continue
         await _send_table_as_image(bot, chat_id, table, task.thread_id)
+
+
+async def _process_table_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Send a standalone table task (a table kept at its place in the prose).
+
+    Table tasks are never merged with content, so a message split as
+    prose → table → prose arrives in that order.
+    """
+    chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    await _send_task_tables(bot, chat_id, task)
+    await _check_and_send_status(bot, user_id, task.window_id or "", task.thread_id)
 
 
 async def _send_task_attachments(bot: Bot, chat_id: int, task: MessageTask) -> None:
@@ -768,6 +781,26 @@ async def enqueue_content_message(
         tables=tables,
     )
     queue.put_nowait(task)
+
+
+async def enqueue_table_message(
+    bot: Bot,
+    user_id: int,
+    window_id: str,
+    table: ParsedTable,
+    thread_id: int | None = None,
+) -> None:
+    """Enqueue one table as its own message, preserving its position."""
+    logger.debug("Enqueue table: user=%d, window_id=%s", user_id, window_id)
+    queue = get_or_create_queue(bot, user_id)
+    queue.put_nowait(
+        MessageTask(
+            task_type="table",
+            window_id=window_id,
+            thread_id=thread_id,
+            tables=[table],
+        )
+    )
 
 
 async def enqueue_voice_message(

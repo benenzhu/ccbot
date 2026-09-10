@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -370,6 +371,7 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        fork_session_id: str | None = None,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
@@ -378,10 +380,14 @@ class TmuxManager:
             window_name: Optional window name (defaults to directory name)
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
+            fork_session_id: Fork the resumed session into this new UUID
 
         Returns:
             Tuple of (success, message, window_name, window_id)
         """
+        if fork_session_id and not resume_session_id:
+            return False, "Fork requires a session to resume", "", ""
+
         # Validate directory first
         path = Path(work_dir).expanduser().resolve()
         if not path.exists():
@@ -420,7 +426,12 @@ class TmuxManager:
                     if pane:
                         cmd = config.claude_command
                         if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
+                            cmd = f"{cmd} --resume {shlex.quote(resume_session_id)}"
+                        if fork_session_id:
+                            cmd = (
+                                f"{cmd} --fork-session"
+                                f" --session-id {shlex.quote(fork_session_id)}"
+                            )
                         pane.send_keys(cmd, enter=True)
 
                 logger.info(

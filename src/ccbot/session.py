@@ -80,6 +80,12 @@ class ClaudeSession:
     summary: str
     message_count: int
     file_path: str
+    custom_title: str = ""
+
+    @property
+    def display_name(self) -> str:
+        """Prefer the name set with Claude's /rename over generated summaries."""
+        return self.custom_title or self.summary
 
 
 @dataclass
@@ -605,7 +611,8 @@ class SessionManager:
             else:
                 return None
 
-        # Single pass: read file once, extract summary + count messages
+        # Single pass: read file once, extract title/summary + count messages
+        custom_title = ""
         summary = ""
         last_user_msg = ""
         message_count = 0
@@ -618,8 +625,17 @@ class SessionManager:
                     message_count += 1
                     try:
                         data = json.loads(line)
+                        if not isinstance(data, dict):
+                            continue
                         # Check for summary
-                        if data.get("type") == "summary":
+                        if data.get("type") == "custom-title":
+                            title = data.get("customTitle")
+                            if (
+                                isinstance(title, str)
+                                and data.get("sessionId", session_id) == session_id
+                            ):
+                                custom_title = title.strip()
+                        elif data.get("type") == "summary":
                             s = data.get("summary", "")
                             if s:
                                 summary = s
@@ -641,6 +657,7 @@ class SessionManager:
             summary=summary,
             message_count=message_count,
             file_path=str(file_path),
+            custom_title=custom_title,
         )
 
     # --- Directory session listing ---

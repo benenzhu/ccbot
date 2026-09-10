@@ -37,6 +37,7 @@ import io
 import logging
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from telegram import (
     Bot,
@@ -77,6 +78,7 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_SESSION_CANCEL,
+    CB_SESSION_FORK,
     CB_SESSION_NEW,
     CB_SESSION_REPLAY,
     CB_SESSION_SELECT,
@@ -106,6 +108,7 @@ from .handlers.directory_browser import (
 )
 from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
+from .handlers.side_question import run_side_question
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
@@ -119,6 +122,7 @@ from .handlers.message_queue import (
     clear_status_msg_info,
     enqueue_content_message,
     enqueue_status_update,
+    enqueue_table_message,
     enqueue_voice_message,
     get_message_queue,
     shutdown_workers,
@@ -130,7 +134,12 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
-from .markdown_v2 import ParsedTable, convert_markdown, extract_markdown_tables
+from .markdown_v2 import (
+    ParsedTable,
+    convert_markdown,
+    extract_markdown_tables,
+    split_text_by_tables,
+)
 from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .monitor_state import TrackedSession
@@ -306,6 +315,44 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+async def btw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask a /btw side question and relay the answer from the TUI panel."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    pieces = text.split(maxsplit=1)
+    question = pieces[1].strip() if len(pieces) > 1 else ""
+    if not question:
+        await safe_reply(update.message, "Usage: /btw <your question>")
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    display = session_manager.get_display_name(wid)
+    logger.info("Side question for window %s (user=%d)", display, user.id)
+    await update.message.chat.send_action(ChatAction.TYPING)
+    ok, answer = await run_side_question(wid, question)
+    if not ok:
+        await safe_reply(update.message, f"❌ [{display}] btw failed: {answer}")
+        return
+    for part in build_response_parts(answer, True, "text", "assistant"):
+        await safe_reply(update.message, part)
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1004,11 +1051,12 @@ async def _create_and_bind_window(
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
     resume_file_path: str | None = None,
-    replay_history: bool = True,
+    replay_history: bool = False,
+    fork_session: bool = False,
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
-    Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+    Shared by directory confirmation, new session, resume, and fork actions.
 
     On resume with replay_history=True, pre-seeds the monitor's byte offset to
     0 so the next poll cycle replays the entire JSONL history to Telegram, and
@@ -1017,6 +1065,9 @@ async def _create_and_bind_window(
     On resume with replay_history=False, pre-seeds the offset to the current
     file size so only output produced after the resume is forwarded, and the
     pending text is sent like a fresh session.
+
+    Forks get a new UUID before launch so monitoring and routing never touch
+    the source session. Inherited messages are skipped by UUID without replay.
     """
     from telegram import CallbackQuery, User
 
@@ -1031,62 +1082,83 @@ async def _create_and_bind_window(
     except BadRequest as e:
         logger.debug("Callback answer failed (already expired?): %s", e)
 
+    fork_session_id = str(uuid4()) if fork_session and resume_session_id else None
+    target_session_id = fork_session_id or resume_session_id
+    target_file_path = resume_file_path
+    if fork_session_id and resume_file_path:
+        target_file_path = str(
+            Path(resume_file_path).with_name(f"{fork_session_id}.jsonl")
+        )
+        if not replay_history and session_monitor is not None:
+            try:
+                await session_monitor.skip_fork_history(
+                    fork_session_id, resume_file_path
+                )
+            except OSError:
+                await safe_edit(
+                    query, "❌ Source session could not be read. Please retry."
+                )
+                return
+
     # Pre-seed monitor offset BEFORE the window starts. Done before window
     # creation to avoid a race with the 2s poll loop.
     #   replay: offset=0 so the very first poll cycle reads the JSONL from
     #           byte 0 and replays history into Telegram.
     #   no replay: offset=EOF so a stale tracked offset from an earlier bind
     #              can't leak old messages; only new output is forwarded.
-    if resume_session_id and resume_file_path and session_monitor is not None:
-        if replay_history:
+    if target_session_id and target_file_path and session_monitor is not None:
+        if replay_history or fork_session_id:
             seed_offset = 0
         else:
             try:
-                seed_offset = Path(resume_file_path).stat().st_size
+                seed_offset = Path(target_file_path).stat().st_size
             except OSError:
                 seed_offset = 0
         session_monitor.state.update_session(
             TrackedSession(
-                session_id=resume_session_id,
-                file_path=resume_file_path,
+                session_id=target_session_id,
+                file_path=target_file_path,
                 last_byte_offset=seed_offset,
             )
         )
         session_monitor.state.save()
-        session_monitor._file_mtimes.pop(resume_session_id, None)
+        session_monitor._file_mtimes.pop(target_session_id, None)
         if replay_history:
             # Replayed history is text-only — no TTS, it would burn quota on
             # messages the user already has.
-            session_monitor.mark_replay(resume_session_id)
+            session_monitor.mark_replay(target_session_id)
         logger.info(
             "Pre-seeded monitor offset=%d for resumed session %s (replay=%s, path=%s)",
             seed_offset,
-            resume_session_id,
+            target_session_id,
             replay_history,
-            resume_file_path,
+            target_file_path,
         )
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id
+        selected_path,
+        resume_session_id=resume_session_id,
+        fork_session_id=fork_session_id,
     )
     if success:
         logger.info(
-            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
+            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s, fork=%s)",
             created_wname,
             created_wid,
             selected_path,
             user.id,
             pending_thread_id,
             resume_session_id,
+            fork_session_id,
         )
 
         # On resume, wire up routing (window_state.session_id + thread binding)
         # BEFORE waiting for the hook. Otherwise the monitor's poll cycle can
         # fire between hook write and bind_thread, dispatching replayed history
         # messages with no active users → silently dropped.
-        if resume_session_id:
+        if target_session_id:
             ws = session_manager.get_window_state(created_wid)
-            ws.session_id = resume_session_id
+            ws.session_id = target_session_id
             ws.cwd = str(selected_path)
             ws.window_name = created_wname
             session_manager._save_state()
@@ -1115,30 +1187,31 @@ async def _create_and_bind_window(
             created_wid, timeout=hook_timeout
         )
 
-        # If the hook reported a session_id that differs from resume_session_id
+        # If the hook reported a session_id that differs from target_session_id
         # (e.g. on older Claude versions), the session_map sync may have
         # overwritten ws.session_id. Restore it so the monitor routes to the
-        # original JSONL.
-        if resume_session_id:
+        # expected JSONL (the new UUID for a fork, never the source).
+        if target_session_id:
             ws = session_manager.get_window_state(created_wid)
             if not hook_ok:
                 logger.warning(
                     "Hook timed out for resume window %s; routing already wired "
                     "with session_id=%s",
                     created_wid,
-                    resume_session_id,
+                    target_session_id,
                 )
-            elif ws.session_id != resume_session_id:
+            elif ws.session_id != target_session_id:
                 logger.info(
                     "Resume override after hook: window %s session_id %s -> %s",
                     created_wid,
                     ws.session_id,
-                    resume_session_id,
+                    target_session_id,
                 )
-                ws.session_id = resume_session_id
+                ws.session_id = target_session_id
                 session_manager._save_state()
 
         if pending_thread_id is not None:
+            action = "Forked into a new session" if fork_session_id else "Resumed"
             if resume_session_id and replay_history:
                 # Resume with replay: discard any pending text so the user can
                 # review the replayed history first and then decide what to send.
@@ -1160,11 +1233,11 @@ async def _create_and_bind_window(
                 )
                 await safe_edit(
                     query,
-                    f"✅ {message}\n\nResumed.{note}",
+                    f"✅ {message}\n\n{action}.{note}",
                 )
             else:
                 done_note = (
-                    "Resumed without history replay. Send messages here."
+                    f"{action} without history replay. Send messages here."
                     if resume_session_id
                     else "Created. Send messages here."
                 )
@@ -1202,6 +1275,11 @@ async def _create_and_bind_window(
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
     else:
+        if fork_session_id and session_monitor is not None:
+            session_monitor.state.remove_session(fork_session_id)
+            session_monitor.state.save()
+            session_monitor._fork_history_uuids.pop(fork_session_id, None)
+            session_monitor._replay_sessions.discard(fork_session_id)
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
@@ -1433,8 +1511,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
-    # Session picker: resume existing session
-    elif data.startswith(CB_SESSION_SELECT):
+    # Session picker: resume or fork an existing session
+    elif data.startswith((CB_SESSION_SELECT, CB_SESSION_FORK)):
+        fork_session = data.startswith(CB_SESSION_FORK)
+        prefix = CB_SESSION_FORK if fork_session else CB_SESSION_SELECT
         pending_tid = (
             context.user_data.get("_pending_thread_id") if context.user_data else None
         )
@@ -1446,7 +1526,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
         try:
-            idx = int(data[len(CB_SESSION_SELECT) :])
+            idx = int(data[len(prefix) :])
         except ValueError:
             await query.answer("Invalid data")
             return
@@ -1482,6 +1562,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             resume_session_id=session.session_id,
             resume_file_path=session.file_path,
             replay_history=replay_history,
+            fork_session=fork_session,
         )
 
     # Session picker: flip the "replay history" toggle and redraw
@@ -1909,25 +1990,49 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         ):
             continue
 
-        # Strip markdown tables out of the text; the queue worker sends them
-        # after the message as native Telegram tables (Bot API 10.1), with a
-        # PNG fallback. Only complete messages get this treatment — partial
-        # streams may have unfinished table syntax.
+        # Markdown tables become native Telegram tables (Bot API 10.1, PNG
+        # fallback). Assistant prose is split at each table so the table stays
+        # where it was written: prose → table → prose, each its own message.
+        # Other content (tool_result edits an earlier message, so it can't be
+        # split) keeps tables trailing after the text. Only complete messages
+        # get this treatment — partial streams may have unfinished syntax.
         text_for_parts = msg.text
         tables: list[ParsedTable] = []
+        segments: list[str | ParsedTable] = []
         if msg.is_complete and msg.content_type != "thinking":
-            stripped, tables = extract_markdown_tables(msg.text)
-            if tables:
-                text_for_parts = stripped
+            if msg.content_type == "text" and msg.role == "assistant":
+                segments = split_text_by_tables(msg.text)
+                if not any(isinstance(seg, tuple) for seg in segments):
+                    segments = []
+            else:
+                stripped, tables = extract_markdown_tables(msg.text)
+                if tables:
+                    text_for_parts = stripped
 
-        parts = build_response_parts(
-            text_for_parts,
-            msg.is_complete,
-            msg.content_type,
-            msg.role,
-        )
-
-        if msg.is_complete:
+        if msg.is_complete and segments:
+            for seg in segments:
+                if isinstance(seg, tuple):
+                    await enqueue_table_message(bot, user_id, wid, seg, thread_id)
+                    continue
+                await enqueue_content_message(
+                    bot=bot,
+                    user_id=user_id,
+                    window_id=wid,
+                    parts=build_response_parts(
+                        seg, msg.is_complete, msg.content_type, msg.role
+                    ),
+                    tool_use_id=msg.tool_use_id,
+                    content_type=msg.content_type,
+                    text=seg,
+                    thread_id=thread_id,
+                )
+        elif msg.is_complete:
+            parts = build_response_parts(
+                text_for_parts,
+                msg.is_complete,
+                msg.content_type,
+                msg.role,
+            )
             await enqueue_content_message(
                 bot=bot,
                 user_id=user_id,
@@ -1941,6 +2046,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 tables=tables or None,
             )
 
+        if msg.is_complete:
             if speak:
                 await enqueue_voice_message(bot, user_id, wid, msg.text, thread_id)
 
@@ -1968,6 +2074,7 @@ async def post_init(application: Application) -> None:
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("btw", "Side question, answered from the session"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
@@ -2045,6 +2152,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
+    application.add_handler(CommandHandler("btw", btw_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))

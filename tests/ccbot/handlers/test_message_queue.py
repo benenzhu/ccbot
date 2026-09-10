@@ -271,3 +271,57 @@ async def test_merge_carries_tables_and_images_from_all_tasks():
     assert merged.parts == ["a", "b"]
     assert merged.image_data == [("img", b"1"), ("img", b"2")]
     assert merged.tables == [(["h"], [["v"]])]
+
+
+# --- Standalone table tasks keep their place between prose messages ---
+
+
+async def test_table_task_breaks_content_merge():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    first = MessageTask(task_type="content", window_id="@1", parts=["before"])
+    table = MessageTask(task_type="table", window_id="@1", tables=[(["h"], [["v"]])])
+    after = MessageTask(task_type="content", window_id="@1", parts=["after"])
+    queue.put_nowait(table)
+    queue.put_nowait(after)
+
+    merged, count = await message_queue._merge_content_tasks(
+        queue, first, asyncio.Lock()
+    )
+
+    assert count == 0
+    assert merged.parts == ["before"]
+    # Queue order untouched: table still comes before the trailing prose
+    assert queue.get_nowait() is table
+    assert queue.get_nowait() is after
+
+
+async def test_table_task_sends_table_then_checks_status():
+    bot = AsyncMock()
+    task = MessageTask(
+        task_type="table", window_id="@1", thread_id=42, tables=[(["h"], [["v"]])]
+    )
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "_send_task_tables", AsyncMock()) as send,
+        patch.object(message_queue, "_check_and_send_status", AsyncMock()) as status,
+    ):
+        await message_queue._process_table_task(bot, 5, task)
+
+    send.assert_awaited_once_with(bot, 777, task)
+    status.assert_awaited_once_with(bot, 5, "@1", 42)
+
+
+async def test_enqueue_table_message_creates_table_task():
+    bot = AsyncMock()
+    with patch.object(message_queue, "get_or_create_queue") as goc:
+        q: asyncio.Queue[MessageTask] = asyncio.Queue()
+        goc.return_value = q
+        await message_queue.enqueue_table_message(bot, 5, "@1", (["h"], [["v"]]), 42)
+
+    task = q.get_nowait()
+    assert task.task_type == "table"
+    assert task.window_id == "@1"
+    assert task.thread_id == 42
+    assert task.tables == [(["h"], [["v"]])]

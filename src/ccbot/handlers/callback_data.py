@@ -44,6 +44,7 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 
 # Session picker (resume existing session)
 CB_SESSION_SELECT = "rs:sel:"  # rs:sel:<index>
+CB_SESSION_FORK = "rs:fork:"  # rs:fork:<index> (resume into a new session)
 CB_SESSION_NEW = "rs:new"  # start a new session
 CB_SESSION_CANCEL = "rs:cancel"  # cancel
 CB_SESSION_REPLAY = "rs:replay"  # toggle history replay on/off

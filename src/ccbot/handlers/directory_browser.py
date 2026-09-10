@@ -29,6 +29,7 @@ from .callback_data import (
     CB_DIR_SELECT,
     CB_DIR_UP,
     CB_SESSION_CANCEL,
+    CB_SESSION_FORK,
     CB_SESSION_NEW,
     CB_SESSION_REPLAY,
     CB_SESSION_SELECT,
@@ -217,48 +218,54 @@ def _relative_time(file_path: str) -> str:
 
 def build_session_picker(
     sessions: list[ClaudeSession],
-    replay_history: bool = True,
+    replay_history: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Build session picker UI for resuming an existing Claude session.
+    """Build session picker UI for resuming or forking a Claude session.
 
     Args:
         sessions: List of ClaudeSession objects (sorted by recency).
         replay_history: Current state of the "replay history" toggle. When
             True, resuming replays the whole transcript into the topic.
+            Defaults to False (only new output is forwarded).
 
     Returns: (text, keyboard).
     """
     lines = [
-        "*Resume Session?*\n",
-        "Existing sessions found in this directory.\n",
+        "*Resume or Fork Session?*\n",
+        "Resume to continue a session, or Fork to branch into a new session.\n",
     ]
     for i, s in enumerate(sessions):
-        summary = s.summary[:40] + "…" if len(s.summary) > 40 else s.summary
+        name = " ".join(s.display_name.split()).replace("`", "′")
+        name = name[:40] + "…" if len(name) > 40 else name
         rel = _relative_time(s.file_path)
         time_str = f" ({rel})" if rel else ""
-        lines.append(f"{i + 1}. {summary} — {s.message_count} msgs{time_str}")
+        lines.append(f"{i + 1}. `{name}` — {s.message_count} msgs{time_str}")
 
     buttons: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(sessions), 2):
-        row = []
-        for j in range(min(2, len(sessions) - i)):
-            s = sessions[i + j]
-            label = s.summary[:14] + "…" if len(s.summary) > 14 else s.summary
-            row.append(
+    for i, s in enumerate(sessions):
+        label = " ".join(s.display_name.split())
+        label = label[:18] + "…" if len(label) > 18 else label
+        buttons.append(
+            [
                 InlineKeyboardButton(
-                    f"▶ {label}", callback_data=f"{CB_SESSION_SELECT}{i + j}"
-                )
-            )
-        buttons.append(row)
+                    f"▶ {i + 1}. {label}", callback_data=f"{CB_SESSION_SELECT}{i}"
+                ),
+                InlineKeyboardButton(
+                    f"⑂ Fork {i + 1}", callback_data=f"{CB_SESSION_FORK}{i}"
+                ),
+            ]
+        )
 
     if replay_history:
-        lines.append("\nHistory: *replayed* into this topic on resume.")
+        lines.append("\nHistory: *replayed* into this topic on resume or fork.")
         toggle_label = "📜 Replay history: ON"
     else:
         lines.append("\nHistory: *not replayed*; only new output is forwarded.")
         toggle_label = "📜 Replay history: OFF"
-    buttons.append(
-        [InlineKeyboardButton(toggle_label, callback_data=CB_SESSION_REPLAY)]
+    lines.append("Tap the history toggle before choosing a session.")
+    lines.append("Claude keeps the conversation context either way.")
+    buttons.insert(
+        0, [InlineKeyboardButton(toggle_label, callback_data=CB_SESSION_REPLAY)]
     )
 
     buttons.append(

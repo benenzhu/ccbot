@@ -91,3 +91,37 @@ class TestTableToMarkdown:
         assert len(tables) == 1
         _, again = extract_markdown_tables(table_to_markdown(tables[0]))
         assert again == tables
+
+
+class TestSplitTextByTables:
+    """split_text_by_tables keeps tables at their original positions."""
+
+    def test_no_tables_returns_whole_text(self):
+        from ccbot.markdown_v2 import split_text_by_tables
+
+        assert split_text_by_tables("just prose\n\nmore") == ["just prose\n\nmore"]
+
+    def test_prose_table_prose_order(self):
+        from ccbot.markdown_v2 import split_text_by_tables
+
+        src = (
+            "before\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nafter\n\n"
+            "| C | D |\n|---|---|\n| 3 | 4 |"
+        )
+        segs = split_text_by_tables(src)
+        assert segs[0] == "before\n"
+        assert segs[1] == (["A", "B"], [["1", "2"]])
+        assert segs[2] == "\nafter\n"
+        assert segs[3] == (["C", "D"], [["3", "4"]])
+        assert len(segs) == 4
+
+    def test_drops_empty_prose_and_keeps_code_block_tables(self):
+        from ccbot.markdown_v2 import split_text_by_tables
+
+        src = (
+            "| A | B |\n|---|---|\n| 1 | 2 |\n\n```\n| not | a table |\n|---|---|\n```"
+        )
+        segs = split_text_by_tables(src)
+        assert segs[0] == (["A", "B"], [["1", "2"]])
+        assert isinstance(segs[1], str) and "| not | a table |" in segs[1]
+        assert len(segs) == 2

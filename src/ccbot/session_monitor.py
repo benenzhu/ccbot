@@ -88,6 +88,22 @@ class SessionMonitor:
         # Sessions whose offset was rewound to replay old history. Messages
         # read from these are flagged is_replay until the offset reaches EOF.
         self._replay_sessions: set[str] = set()
+        # Forks copy messages with their original UUIDs but rewrite the JSONL,
+        # so a source byte offset cannot be used to skip inherited history.
+        self._fork_history_uuids: dict[str, set[str]] = {}
+
+    async def skip_fork_history(self, session_id: str, source_path: str) -> None:
+        """Remember inherited message UUIDs before starting a fork without replay."""
+        uuids: set[str] = set()
+        async with aiofiles.open(source_path, "r", encoding="utf-8") as f:
+            async for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(entry, dict) and isinstance(entry.get("uuid"), str):
+                    uuids.add(entry["uuid"])
+        self._fork_history_uuids[session_id] = uuids
 
     def mark_replay(self, session_id: str) -> None:
         """Flag a session as replaying history (suppresses TTS downstream)."""
@@ -208,10 +224,13 @@ class SessionMonitor:
 
         Detects file truncation (e.g. after /clear) and resets offset.
         Recovers from corrupted offsets (mid-line) by scanning to next line.
+        Retries incomplete writes, but skips malformed newline-terminated records.
         """
         new_entries = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            # Read bytes so an incomplete UTF-8 character at EOF cannot prevent
+            # decoding earlier, complete records in the same buffered read.
+            async with aiofiles.open(file_path, "rb") as f:
                 # Get file size to detect truncation
                 await f.seek(0, 2)  # Seek to end
                 file_size = await f.tell()
@@ -227,46 +246,52 @@ class SessionMonitor:
                     )
                     session.last_byte_offset = 0
 
-                # Seek to last read position for incremental reading
+                # A byte offset is at a line boundary only if the preceding
+                # byte is a newline. Looking for '{' can mistake a nested
+                # object for a record, or reject a valid indented record.
+                if session.last_byte_offset > 0:
+                    await f.seek(session.last_byte_offset - 1)
+                    if await f.read(1) != b"\n":
+                        remainder = await f.readline()
+                        if remainder.endswith(b"\n"):
+                            logger.warning(
+                                "Corrupted offset %d in session %s (mid-line), "
+                                "scanning to next line",
+                                session.last_byte_offset,
+                                session.session_id,
+                            )
+                            session.last_byte_offset = await f.tell()
+                        return []
                 await f.seek(session.last_byte_offset)
 
-                # Detect corrupted offset: if we're mid-line (not at '{'),
-                # scan forward to the next line start. This can happen if
-                # the state file was manually edited or corrupted.
-                if session.last_byte_offset > 0:
-                    first_char = await f.read(1)
-                    if first_char and first_char != "{":
-                        logger.warning(
-                            "Corrupted offset %d in session %s (mid-line), "
-                            "scanning to next line",
-                            session.last_byte_offset,
-                            session.session_id,
-                        )
-                        await f.readline()  # Skip rest of partial line
-                        session.last_byte_offset = await f.tell()
-                        return []
-                    await f.seek(session.last_byte_offset)  # Reset for normal read
-
-                # Read only new lines from the offset.
-                # Track safe_offset: only advance past lines that parsed
-                # successfully. A non-empty line that fails JSON parsing is
-                # likely a partial write; stop and retry next cycle.
+                # Only an unterminated invalid line may still be in flight.
+                # Retrying a malformed record that already has a newline would
+                # block every subsequent message in this session forever.
                 safe_offset = session.last_byte_offset
                 async for line in f:
-                    data = TranscriptParser.parse_line(line)
-                    if data:
-                        new_entries.append(data)
-                        safe_offset = await f.tell()
+                    try:
+                        data = TranscriptParser.parse_line(line.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        data = None
+                    if isinstance(data, dict):
+                        if data:
+                            new_entries.append(data)
                     elif line.strip():
-                        # Partial JSONL line — don't advance offset past it
+                        if not line.endswith(b"\n"):
+                            logger.debug(
+                                "Partial JSONL line in session %s at byte offset %d, "
+                                "will retry next cycle",
+                                session.session_id,
+                                safe_offset,
+                            )
+                            break
                         logger.warning(
-                            "Partial JSONL line in session %s, will retry next cycle",
+                            "Skipping malformed JSONL line in session %s "
+                            "at byte offset %d",
                             session.session_id,
+                            safe_offset,
                         )
-                        break
-                    else:
-                        # Empty line — safe to skip
-                        safe_offset = await f.tell()
+                    safe_offset = await f.tell()
 
                 session.last_byte_offset = safe_offset
 
@@ -335,10 +360,26 @@ class SessionMonitor:
                 is_replay = session_info.session_id in self._replay_sessions
 
                 # File changed, read new content from last offset
+                previous_offset = tracked.last_byte_offset
                 new_entries = await self._read_new_lines(
                     tracked, session_info.file_path
                 )
                 self._file_mtimes[session_info.session_id] = current_mtime
+
+                inherited = self._fork_history_uuids.get(session_info.session_id)
+                if inherited is not None:
+                    new_entries = [
+                        entry
+                        for entry in new_entries
+                        if entry.get("uuid") not in inherited
+                    ]
+                    # Keep the filter across partial writes of the copied
+                    # transcript, until the first new conversation message.
+                    if any(
+                        entry.get("type") in ("user", "assistant") and entry.get("uuid")
+                        for entry in new_entries
+                    ):
+                        self._fork_history_uuids.pop(session_info.session_id, None)
 
                 if new_entries:
                     logger.debug(
@@ -382,7 +423,8 @@ class SessionMonitor:
                 if is_replay and tracked.last_byte_offset >= current_size:
                     self._replay_sessions.discard(session_info.session_id)
 
-                self.state.update_session(tracked)
+                if tracked.last_byte_offset != previous_offset:
+                    self.state.update_session(tracked)
 
             except OSError as e:
                 logger.debug(f"Error processing session {session_info.session_id}: {e}")
@@ -435,6 +477,7 @@ class SessionMonitor:
             for session_id in stale_sessions:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._fork_history_uuids.pop(session_id, None)
             self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
@@ -477,6 +520,7 @@ class SessionMonitor:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
+                self._fork_history_uuids.pop(session_id, None)
             self.state.save_if_dirty()
 
         # Update last known map

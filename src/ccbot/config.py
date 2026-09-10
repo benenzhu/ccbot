@@ -113,12 +113,15 @@ class Config:
         # are rendered to PNG images instead.
         self.native_tables = os.getenv("CCBOT_NATIVE_TABLES", "true").lower() != "false"
 
+        # How long /btw waits for Claude Code's side-question panel to settle.
+        self.btw_timeout = float(os.getenv("CCBOT_BTW_TIMEOUT", "120"))
+
         # Default for the "replay history" toggle in the session picker.
         # When True, resuming a session replays its full JSONL history into
         # the topic; when False, only new output after resume is forwarded.
-        # The user can flip it per resume via the picker button.
+        # Off by default; the user can enable it for each resume or fork.
         self.resume_replay_history = (
-            os.getenv("CCBOT_RESUME_REPLAY", "true").lower() != "false"
+            os.getenv("CCBOT_RESUME_REPLAY", "false").lower() == "true"
         )
 
         # OpenAI API for voice message transcription (optional)

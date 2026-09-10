@@ -112,6 +112,33 @@ def extract_markdown_tables(text: str) -> tuple[str, list[ParsedTable]]:
     return "\n".join(out), tables
 
 
+def split_text_by_tables(text: str) -> list[str | ParsedTable]:
+    """Split text into an ordered list of prose strings and parsed tables.
+
+    Keeps each table at its original position so the caller can send
+    prose → table → prose as separate messages in reading order. Prose
+    segments that are empty after stripping are dropped. Tables inside
+    fenced code blocks are left in the prose untouched.
+    """
+    matches = _scan_tables(text)
+    if not matches:
+        return [text]
+
+    lines = text.split("\n")
+    segments: list[str | ParsedTable] = []
+    cursor = 0
+    for start, end, table in matches:
+        prose = "\n".join(lines[cursor:start])
+        if prose.strip():
+            segments.append(prose)
+        segments.append(table)
+        cursor = end
+    tail = "\n".join(lines[cursor:])
+    if tail.strip():
+        segments.append(tail)
+    return segments
+
+
 def table_to_markdown(table: ParsedTable) -> str:
     """Serialize a parsed table back to GitHub-flavored pipe syntax.
 

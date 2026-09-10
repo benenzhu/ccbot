@@ -92,7 +92,8 @@ ALLOWED_USERS=your_telegram_user_id
 | `CLAUDE_COMMAND` | `claude` | 新窗口中运行的命令 |
 | `MONITOR_POLL_INTERVAL` | `2.0` | 轮询间隔（秒） |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | 在目录浏览器中显示隐藏（点开头）目录 |
-| `CCBOT_RESUME_REPLAY` | `true` | 会话选择器里"回放历史"开关的默认值：恢复会话时是否把完整历史回放到 topic，关闭则只转发恢复之后的新输出 |
+| `CCBOT_BTW_TIMEOUT` | `120` | 等待 `/btw` 回答的秒数 |
+| `CCBOT_RESUME_REPLAY` | `false` | 会话选择器里"回放历史"开关的默认值：默认只转发新输出；恢复或创建分支前开启开关，可把完整历史回放到 topic |
 | `OPENAI_API_KEY` | _(无)_ | OpenAI API 密钥，用于语音消息转录 |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API 基础 URL（用于代理或兼容 API） |
 
@@ -148,6 +149,7 @@ uv run ccbot
 | `/history` | 当前话题的消息历史 |
 | `/screenshot` | 截取终端屏幕 |
 | `/esc` | 发送 Escape 键中断 Claude |
+| `/btw <问题>` | 旁路提问：用 Claude Code 自带的 /btw 按当前会话上下文回答，不进入对话 |
 
 **Claude Code 命令（通过 tmux 转发）：**
 
@@ -170,8 +172,8 @@ uv run ccbot
 1. 在 Telegram 群组中创建新话题
 2. 在话题中发送任意消息
 3. 弹出目录浏览器 — 选择项目目录
-4. 如果该目录下已有 Claude 会话，会弹出会话选择器 — 选择恢复已有会话或创建新会话
-5. 自动创建 tmux 窗口，启动 `claude`（恢复时使用 `--resume`），并转发待处理的消息
+4. 如果该目录下已有 Claude 会话，会弹出会话选择器，优先显示通过 `/rename` 设置的名字，没有名字时显示摘要或最后一条用户消息。点击会话可恢复，点击旁边的 **Fork** 可创建分支，也可以创建全新会话。
+5. 自动创建 tmux 窗口，沿用 `CLAUDE_COMMAND` 启动命令：恢复时追加 `--resume`，分支再追加 `--fork-session`。分支继承对话内容并使用新的会话 ID。会话按钮上方的 **Replay history** 开关对恢复和分支都生效，默认 **OFF**：只转发新输出，并发送触发选择器的消息。选择会话前切换到 **ON**，则回放历史、不发送该消息。两种选择都会保留 Claude 的对话上下文。
 
 **发送消息：**
 
