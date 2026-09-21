@@ -16,8 +16,11 @@ from ccbot.handlers.callback_data import (
     CB_SESSION_SELECT,
 )
 from ccbot.handlers.directory_browser import (
-    REPLAY_KEY,
+    SESSION_CHOICE_KEY,
     SESSIONS_KEY,
+    STATE_KEY,
+    STATE_SELECTING_REPLAY,
+    STATE_SELECTING_SESSION,
     build_session_picker,
 )
 from ccbot.monitor_state import TrackedSession
@@ -66,10 +69,12 @@ async def test_picker_uses_latest_session_name(
     assert session.display_name == expected
     text, keyboard = build_session_picker([session])
     assert f"`{expected}`" in text
-    toggle = keyboard.inline_keyboard[0][0]
-    assert toggle.callback_data == CB_SESSION_REPLAY
-    assert toggle.text.endswith("OFF")
-    resume, fork = keyboard.inline_keyboard[1]
+    assert all(
+        not button.callback_data.startswith(CB_SESSION_REPLAY)
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
+    resume, fork = keyboard.inline_keyboard[0]
     assert resume.callback_data == f"{CB_SESSION_SELECT}0"
     assert fork.callback_data == f"{CB_SESSION_FORK}0"
     if expected == "m3_1":
@@ -90,22 +95,36 @@ async def test_session_selection_routes_action(tmp_path, fork, stale, replay):
     context.user_data = {
         "_pending_thread_id": 42,
         "_selected_path": str(tmp_path),
+        STATE_KEY: STATE_SELECTING_SESSION,
         SESSIONS_KEY: [ClaudeSession("source", "summary", 1, "source.jsonl")],
-        REPLAY_KEY: False,
     }
     with (
         patch.object(bot, "_get_thread_id", return_value=99 if stale else 42),
         patch.object(bot, "_create_and_bind_window", new_callable=AsyncMock) as create,
         patch.object(bot, "safe_edit", new_callable=AsyncMock),
+        patch.object(bot, "send_with_fallback", new_callable=AsyncMock) as send,
     ):
-        if replay:
-            update.callback_query.data = CB_SESSION_REPLAY
-            await bot.callback_handler(update, context)
-            assert context.user_data[REPLAY_KEY] is (not stale)
-            update.callback_query.data = f"{prefix}0"
         await bot.callback_handler(update, context)
+        create.assert_not_awaited()
+        if not stale:
+            # Selecting a session sends a separate question and starts nothing.
+            send.assert_awaited_once()
+            assert send.call_args.kwargs["message_thread_id"] == 42
+            assert "Selected: `summary`" in send.call_args.args[2]
+            assert context.user_data[STATE_KEY] == STATE_SELECTING_REPLAY
+            keyboard = send.call_args.kwargs["reply_markup"]
+            yes, no = keyboard.inline_keyboard[0]
+            assert yes.text == "📜 Send transcript"
+            assert no.text == "▶ Only new messages"
+            update.callback_query.data = (
+                yes.callback_data if replay else no.callback_data
+            )
+            await bot.callback_handler(update, context)
+            # Repeated taps on an already handled question cannot start twice.
+            await bot.callback_handler(update, context)
     if stale:
         create.assert_not_awaited()
+        send.assert_not_awaited()
         assert SESSIONS_KEY in context.user_data
     else:
         create.assert_awaited_once_with(
@@ -120,6 +139,82 @@ async def test_session_selection_routes_action(tmp_path, fork, stale, replay):
             fork_session=fork,
         )
         assert SESSIONS_KEY not in context.user_data
+        assert SESSION_CHOICE_KEY not in context.user_data
+
+
+@pytest.mark.parametrize(
+    "action", ["back", "cancel", "stale", "wrong_topic", "closed_topic"]
+)
+async def test_transcript_prompt_navigation_and_stale_choices(tmp_path, action):
+    update = MagicMock()
+    update.effective_user.id = 12345
+    update.effective_chat = None
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.data = (
+        f"{CB_SESSION_REPLAY}:token:{action if action in ('back', 'cancel') else 'yes'}"
+    )
+    session = ClaudeSession("source", "summary", 1, "source.jsonl")
+    context = MagicMock()
+    context.user_data = {
+        STATE_KEY: STATE_SELECTING_REPLAY,
+        "_pending_thread_id": None if action == "closed_topic" else 42,
+        "_pending_thread_text": "pending prompt",
+        "_selected_path": str(tmp_path),
+        SESSIONS_KEY: [session],
+        SESSION_CHOICE_KEY: {
+            "session": session,
+            "fork_session": True,
+            "token": "newer-token" if action == "stale" else "token",
+        },
+    }
+    with (
+        patch.object(
+            bot, "_get_thread_id", return_value=99 if action == "wrong_topic" else 42
+        ),
+        patch.object(bot, "_create_and_bind_window", new_callable=AsyncMock) as create,
+        patch.object(bot, "safe_edit", new_callable=AsyncMock) as edit,
+    ):
+        await bot.callback_handler(update, context)
+    create.assert_not_awaited()
+    if action == "cancel":
+        assert not context.user_data
+    elif action == "back":
+        assert context.user_data[STATE_KEY] == STATE_SELECTING_SESSION
+        assert SESSION_CHOICE_KEY not in context.user_data
+        assert context.user_data["_pending_thread_text"] == "pending prompt"
+        keyboard = edit.call_args.kwargs["reply_markup"]
+        assert keyboard.inline_keyboard[0][0].callback_data == f"{CB_SESSION_SELECT}0"
+    else:
+        assert context.user_data[STATE_KEY] == STATE_SELECTING_REPLAY
+        assert update.callback_query.answer.call_args.kwargs["show_alert"]
+        edit.assert_not_awaited()
+
+
+async def test_failed_transcript_prompt_restores_session_picker(tmp_path):
+    update = MagicMock()
+    update.effective_user.id = 12345
+    update.effective_chat = None
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.data = f"{CB_SESSION_SELECT}0"
+    context = MagicMock()
+    context.user_data = {
+        STATE_KEY: STATE_SELECTING_SESSION,
+        "_pending_thread_id": 42,
+        "_selected_path": str(tmp_path),
+        SESSIONS_KEY: [ClaudeSession("source", "summary", 1, "source.jsonl")],
+    }
+    with (
+        patch.object(bot, "_get_thread_id", return_value=42),
+        patch.object(bot, "_create_and_bind_window", new_callable=AsyncMock) as create,
+        patch.object(bot, "safe_edit", new_callable=AsyncMock),
+        patch.object(
+            bot, "send_with_fallback", new_callable=AsyncMock, return_value=None
+        ),
+    ):
+        await bot.callback_handler(update, context)
+    assert context.user_data[STATE_KEY] == STATE_SELECTING_SESSION
+    assert SESSION_CHOICE_KEY not in context.user_data
+    create.assert_not_awaited()
 
 
 @pytest.mark.parametrize("fork", [False, True])

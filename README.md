@@ -96,7 +96,6 @@ ALLOWED_USERS=your_telegram_user_id
 | `MONITOR_POLL_INTERVAL` | `2.0`      | Polling interval in seconds                      |
 | `CCBOT_SHOW_HIDDEN_DIRS` | `false` | Show hidden (dot) directories in directory browser |
 | `CCBOT_BTW_TIMEOUT` | `120` | Seconds to wait for a `/btw` answer |
-| `CCBOT_RESUME_REPLAY` | `false` | Default for the session picker's "Replay history" toggle: only new output is forwarded by default; enable the toggle before resuming or forking to replay the full transcript into the topic |
 | `OPENAI_API_KEY` | _(none)_ | OpenAI API key for voice message transcription |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI API base URL (for proxies or compatible APIs) |
 
@@ -177,7 +176,8 @@ Any unrecognized `/command` is also forwarded to Claude Code as-is (e.g. `/revie
 2. Send any message in the topic
 3. A directory browser appears — select the project directory
 4. If the directory has existing Claude sessions, a session picker appears. Names set with `/rename` are shown first, falling back to a summary or the last user message. Choose a session to resume, use its **Fork** button to branch into a new session, or start fresh.
-5. A tmux window is created using `CLAUDE_COMMAND`, with `--resume` for an existing session and `--fork-session` for a branch. Forks inherit the conversation with a new session ID. The **Replay history** toggle above the session buttons applies to both and defaults to **OFF**: only new output is forwarded and the triggering message is sent. Turn it **ON** before choosing a session to replay history and discard the triggering message. Claude retains the conversation context either way.
+5. After you select **Resume** or **Fork**, the bot sends a separate message asking whether to **Send transcript** or show **Only new messages**. Sending the transcript replays history into the topic and skips the triggering message. Only new messages continues the session and sends the triggering message. Claude retains the conversation context either way.
+6. Once you choose, a tmux window is created using `CLAUDE_COMMAND`, with `--resume` for an existing session and `--fork-session` for a branch. Forks inherit the conversation with a new session ID.
 
 **Sending messages:**
 

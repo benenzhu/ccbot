@@ -50,8 +50,9 @@ BROWSE_PAGE_KEY = "browse_page"
 BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
+STATE_SELECTING_REPLAY = "selecting_replay"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
-REPLAY_KEY = "resume_replay"  # bool: replay history on resume
+SESSION_CHOICE_KEY = "session_choice"  # Selected session, fork flag, prompt token
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -75,7 +76,7 @@ def clear_session_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(SESSIONS_KEY, None)
-        user_data.pop(REPLAY_KEY, None)
+        user_data.pop(SESSION_CHOICE_KEY, None)
 
 
 def build_window_picker(
@@ -218,15 +219,11 @@ def _relative_time(file_path: str) -> str:
 
 def build_session_picker(
     sessions: list[ClaudeSession],
-    replay_history: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Build session picker UI for resuming or forking a Claude session.
 
     Args:
         sessions: List of ClaudeSession objects (sorted by recency).
-        replay_history: Current state of the "replay history" toggle. When
-            True, resuming replays the whole transcript into the topic.
-            Defaults to False (only new output is forwarded).
 
     Returns: (text, keyboard).
     """
@@ -256,18 +253,6 @@ def build_session_picker(
             ]
         )
 
-    if replay_history:
-        lines.append("\nHistory: *replayed* into this topic on resume or fork.")
-        toggle_label = "📜 Replay history: ON"
-    else:
-        lines.append("\nHistory: *not replayed*; only new output is forwarded.")
-        toggle_label = "📜 Replay history: OFF"
-    lines.append("Tap the history toggle before choosing a session.")
-    lines.append("Claude keeps the conversation context either way.")
-    buttons.insert(
-        0, [InlineKeyboardButton(toggle_label, callback_data=CB_SESSION_REPLAY)]
-    )
-
     buttons.append(
         [
             InlineKeyboardButton("➕ New Session", callback_data=CB_SESSION_NEW),
@@ -277,3 +262,37 @@ def build_session_picker(
 
     text = "\n".join(lines)
     return text, InlineKeyboardMarkup(buttons)
+
+
+def build_session_replay_prompt(
+    session: ClaudeSession, fork_session: bool, token: str
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Ask about transcript delivery after the user has selected a session."""
+    name = " ".join(session.display_name.split()).replace("`", "′")
+    name = name[:80] + "…" if len(name) > 80 else name
+    action = "Fork" if fork_session else "Resume"
+    text = (
+        f"*{action} session*\n\nSelected: `{name}`\n\n"
+        "Send this session's previous transcript to this topic?\n"
+        "Claude keeps the conversation context either way.\n\n"
+        "Sending the transcript skips your pending message; choosing only new "
+        "messages sends it to Claude."
+    )
+    prefix = f"{CB_SESSION_REPLAY}:{token}:"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📜 Send transcript", callback_data=f"{prefix}yes"
+                ),
+                InlineKeyboardButton(
+                    "▶ Only new messages", callback_data=f"{prefix}no"
+                ),
+            ],
+            [
+                InlineKeyboardButton("Back", callback_data=f"{prefix}back"),
+                InlineKeyboardButton("Cancel", callback_data=f"{prefix}cancel"),
+            ],
+        ]
+    )
+    return text, keyboard

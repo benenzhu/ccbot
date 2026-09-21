@@ -92,15 +92,17 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
-    REPLAY_KEY,
+    SESSION_CHOICE_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_SELECTING_REPLAY,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
     build_session_picker,
+    build_session_replay_prompt,
     build_window_picker,
     clear_browse_state,
     clear_session_picker_state,
@@ -904,17 +906,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
 
-    # Ignore text in session picker mode (only for the same thread)
-    if (
-        context.user_data
-        and context.user_data.get(STATE_KEY) == STATE_SELECTING_SESSION
+    # Wait for the session or transcript choice (only for the same thread).
+    if context.user_data and context.user_data.get(STATE_KEY) in (
+        STATE_SELECTING_SESSION,
+        STATE_SELECTING_REPLAY,
     ):
         pending_tid = context.user_data.get("_pending_thread_id")
         if pending_tid == thread_id:
-            await safe_reply(
-                update.message,
-                "Please use the session picker above, or tap Cancel.",
+            prompt = (
+                "Please choose Send transcript or Only new messages above, or tap Cancel."
+                if context.user_data.get(STATE_KEY) == STATE_SELECTING_REPLAY
+                else "Please use the session picker above, or tap Cancel."
             )
+            await safe_reply(update.message, prompt)
             return
         # Stale picker state from a different thread — clear it
         clear_session_picker_state(context.user_data)
@@ -1484,10 +1488,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
                 context.user_data[SESSIONS_KEY] = sessions
                 context.user_data["_selected_path"] = selected_path
-                context.user_data[REPLAY_KEY] = config.resume_replay_history
-            text, keyboard = build_session_picker(
-                sessions, replay_history=config.resume_replay_history
-            )
+                context.user_data.pop(SESSION_CHOICE_KEY, None)
+            text, keyboard = build_session_picker(sessions)
             await safe_edit(query, text, reply_markup=keyboard)
             await query.answer()
             return
@@ -1513,6 +1515,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Session picker: resume or fork an existing session
     elif data.startswith((CB_SESSION_SELECT, CB_SESSION_FORK)):
+        if (
+            context.user_data is None
+            or context.user_data.get(STATE_KEY) != STATE_SELECTING_SESSION
+        ):
+            await query.answer(
+                "Picker expired, please use the latest prompt", show_alert=True
+            )
+            return
         fork_session = data.startswith(CB_SESSION_FORK)
         prefix = CB_SESSION_FORK if fork_session else CB_SESSION_SELECT
         pending_tid = (
@@ -1524,6 +1534,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pending_tid = _get_thread_id(update)
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        if pending_tid is None:
+            await query.answer("Please use a named topic", show_alert=True)
             return
         try:
             idx = int(data[len(prefix) :])
@@ -1539,19 +1552,77 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         session = cached_sessions[idx]
-        selected_path = (
-            context.user_data.get("_selected_path", str(Path.cwd()))
-            if context.user_data
-            else str(Path.cwd())
+        token = uuid4().hex[:12]
+        context.user_data[SESSION_CHOICE_KEY] = {
+            "session": session,
+            "fork_session": fork_session,
+            "token": token,
+        }
+        context.user_data[STATE_KEY] = STATE_SELECTING_REPLAY
+        context.user_data["_pending_thread_id"] = pending_tid
+        await query.answer()
+        await safe_edit(
+            query,
+            "Session selected. Choose transcript delivery below.",
+            reply_markup=None,
         )
-        replay_history = bool(
-            context.user_data.get(REPLAY_KEY, config.resume_replay_history)
-            if context.user_data
-            else config.resume_replay_history
+        text, keyboard = build_session_replay_prompt(session, fork_session, token)
+        prompt = await send_with_fallback(
+            context.bot,
+            chat.id if chat else session_manager.resolve_chat_id(user.id, pending_tid),
+            text,
+            message_thread_id=pending_tid,
+            reply_markup=keyboard,
         )
+        if prompt is None:
+            # Restore the picker if Telegram could not deliver the next step.
+            context.user_data.pop(SESSION_CHOICE_KEY, None)
+            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            text, keyboard = build_session_picker(cached_sessions)
+            await safe_edit(query, text, reply_markup=keyboard)
+
+    # Second step: explicitly choose transcript delivery for the selected session.
+    elif data == CB_SESSION_REPLAY or data.startswith(f"{CB_SESSION_REPLAY}:"):
+        choice = (
+            context.user_data.get(SESSION_CHOICE_KEY) if context.user_data else None
+        )
+        parts = data[len(CB_SESSION_REPLAY) + 1 :].split(":")
+        if (
+            context.user_data is None
+            or context.user_data.get(STATE_KEY) != STATE_SELECTING_REPLAY
+            or not choice
+            or len(parts) != 2
+            or parts[0] != choice["token"]
+            or parts[1] not in ("yes", "no", "back", "cancel")
+        ):
+            await query.answer(
+                "Choice expired, please use the latest prompt", show_alert=True
+            )
+            return
+        pending_tid = context.user_data.get("_pending_thread_id")
+        if pending_tid is None or _get_thread_id(update) != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+
+        action = parts[1]
+        if action == "back":
+            context.user_data.pop(SESSION_CHOICE_KEY, None)
+            context.user_data[STATE_KEY] = STATE_SELECTING_SESSION
+            text, keyboard = build_session_picker(context.user_data[SESSIONS_KEY])
+            await safe_edit(query, text, reply_markup=keyboard)
+            await query.answer()
+            return
+
+        session = choice["session"]
+        selected_path = context.user_data.get("_selected_path", str(Path.cwd()))
         clear_session_picker_state(context.user_data)
-        if context.user_data is not None:
-            context.user_data.pop("_selected_path", None)
+        context.user_data.pop("_selected_path", None)
+        if action == "cancel":
+            context.user_data.pop("_pending_thread_id", None)
+            context.user_data.pop("_pending_thread_text", None)
+            await safe_edit(query, "Cancelled", reply_markup=None)
+            await query.answer("Cancelled")
+            return
 
         await _create_and_bind_window(
             query,
@@ -1561,34 +1632,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pending_tid,
             resume_session_id=session.session_id,
             resume_file_path=session.file_path,
-            replay_history=replay_history,
-            fork_session=fork_session,
-        )
-
-    # Session picker: flip the "replay history" toggle and redraw
-    elif data == CB_SESSION_REPLAY:
-        pending_tid = (
-            context.user_data.get("_pending_thread_id") if context.user_data else None
-        )
-        if pending_tid is not None and _get_thread_id(update) != pending_tid:
-            await query.answer("Stale picker (topic mismatch)", show_alert=True)
-            return
-        cached_sessions = (
-            context.user_data.get(SESSIONS_KEY, []) if context.user_data else []
-        )
-        if not cached_sessions or context.user_data is None:
-            await query.answer("Picker expired, please retry", show_alert=True)
-            return
-        replay_history = not context.user_data.get(
-            REPLAY_KEY, config.resume_replay_history
-        )
-        context.user_data[REPLAY_KEY] = replay_history
-        text, keyboard = build_session_picker(
-            cached_sessions, replay_history=replay_history
-        )
-        await safe_edit(query, text, reply_markup=keyboard)
-        await query.answer(
-            "History will be replayed" if replay_history else "History replay off"
+            replay_history=action == "yes",
+            fork_session=choice["fork_session"],
         )
 
     elif data == CB_SESSION_NEW:
