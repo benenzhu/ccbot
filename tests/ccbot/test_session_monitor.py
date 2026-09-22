@@ -251,7 +251,255 @@ class TestReadNewLinesOffsetRecovery:
         assert messages[0].text == "complete after append"
         assert session.last_byte_offset == path.stat().st_size
         save.assert_called_once()
-        persisted = json.loads(monitor.state.state_file.read_text())
-        assert persisted["tracked_sessions"][session.session_id][
-            "last_byte_offset"
-        ] == len(line)
+
+        def persisted_offset() -> int:
+            data = json.loads(monitor.state.state_file.read_text())
+            return data["tracked_sessions"][session.session_id]["last_byte_offset"]
+
+        # Read but not delivered yet: a restart must re-read the line
+        assert persisted_offset() == 0
+
+        assert messages[0].ticket is not None
+        messages[0].ticket.release()
+        monitor.state.save_if_dirty()
+        assert persisted_offset() == len(line)
+
+
+class TestAtLeastOnceDelivery:
+    """The persisted offset never moves past a message that wasn't delivered."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    def _persisted_offset(self, monitor, session_id: str) -> int:
+        monitor.state.save()
+        data = json.loads(monitor.state.state_file.read_text())
+        return data["tracked_sessions"][session_id]["last_byte_offset"]
+
+    async def test_saved_offset_waits_for_earliest_undelivered_line(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        path = tmp_path / "session.jsonl"
+        lines = [
+            (json.dumps(make_jsonl_entry(content=text)) + "\n").encode()
+            for text in ("first", "second")
+        ]
+        path.write_bytes(b"".join(lines))
+        session = TrackedSession(session_id="s", file_path=str(path))
+        monitor.state.update_session(session)
+        monkeypatch.setattr(
+            monitor,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+
+        first, second = await monitor.check_for_updates({"s"})
+        assert [first.text, second.text] == ["first", "second"]
+        assert self._persisted_offset(monitor, "s") == 0
+
+        # Out-of-order delivery: the earlier line still pins the offset
+        second.ticket.release()
+        assert self._persisted_offset(monitor, "s") == 0
+
+        first.ticket.release()
+        assert self._persisted_offset(monitor, "s") == path.stat().st_size
+
+    async def test_restart_rereads_undelivered_messages(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        path = tmp_path / "session.jsonl"
+        lines = [
+            (json.dumps(make_jsonl_entry(content=text)) + "\n").encode()
+            for text in ("delivered", "still queued")
+        ]
+        path.write_bytes(b"".join(lines))
+        monitor.state.update_session(
+            TrackedSession(session_id="s", file_path=str(path))
+        )
+        monkeypatch.setattr(
+            monitor,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+        delivered, _queued = await monitor.check_for_updates({"s"})
+        delivered.ticket.release()
+        monitor.state.save()  # what shutdown does
+
+        restarted = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+        monkeypatch.setattr(
+            restarted,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+        messages = await restarted.check_for_updates({"s"})
+        assert [m.text for m in messages] == ["still queued"]
+
+    async def test_monitor_loop_releases_ticket_when_nothing_was_queued(self, monitor):
+        from ccbot.session_monitor import NewMessage
+
+        session = TrackedSession(session_id="s", file_path="/x", last_byte_offset=50)
+        monitor.state.update_session(session)
+        msg = NewMessage(
+            session_id="s",
+            text="hi",
+            is_complete=True,
+            ticket=monitor.state.open_ticket(session, 10),
+        )
+        assert session.resume_offset == 10
+
+        # Same release the loop performs once the callback returns
+        held = msg.ticket.hold()  # a queued task would hold it like this
+        msg.ticket.release()
+        assert session.resume_offset == 10
+        held.release()
+        assert session.resume_offset == 50
+
+
+class TestCompactReplay:
+    """History replay drops thinking/tool messages, one divider per run."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    def _write_history(self, path, make_jsonl_entry):
+        entries = [
+            make_jsonl_entry("user", [{"type": "text", "text": "fix the bug"}]),
+            make_jsonl_entry(
+                "assistant",
+                [
+                    {"type": "thinking", "thinking": "let me look"},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {}},
+                ],
+            ),
+            make_jsonl_entry(
+                "user",
+                [{"type": "tool_result", "tool_use_id": "t1", "content": "data"}],
+            ),
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "tool_use", "id": "t2", "name": "Bash", "input": {}}],
+            ),
+            make_jsonl_entry(
+                "user",
+                [{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}],
+            ),
+            make_jsonl_entry("assistant", [{"type": "text", "text": "fixed it"}]),
+            make_jsonl_entry(
+                "assistant",
+                [{"type": "tool_use", "id": "t3", "name": "Read", "input": {}}],
+            ),
+            make_jsonl_entry(
+                "user",
+                [{"type": "tool_result", "tool_use_id": "t3", "content": "x"}],
+            ),
+            make_jsonl_entry("assistant", [{"type": "text", "text": "all done"}]),
+        ]
+        path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+
+    async def _replay(self, monitor, tmp_path, make_jsonl_entry, monkeypatch):
+        path = tmp_path / "session.jsonl"
+        self._write_history(path, make_jsonl_entry)
+        monitor.state.update_session(
+            TrackedSession(session_id="s", file_path=str(path))
+        )
+        monitor.mark_replay("s")
+        monkeypatch.setattr(
+            monitor,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+        return await monitor.check_for_updates({"s"})
+
+    async def test_runs_of_tool_and_thinking_collapse_to_one_divider(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        from ccbot.session_monitor import REPLAY_DIVIDER
+
+        monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", True)
+        messages = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
+
+        assert [m.text for m in messages] == [
+            "fix the bug",
+            REPLAY_DIVIDER,
+            "fixed it",
+            REPLAY_DIVIDER,
+            "all done",
+        ]
+        assert all(m.content_type == "text" for m in messages)
+        assert all(m.is_replay for m in messages)
+        assert all(m.tool_use_id is None for m in messages)
+
+    async def test_full_replay_when_disabled(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", False)
+        messages = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
+
+        types = [m.content_type for m in messages]
+        assert "tool_use" in types
+        assert "tool_result" in types
+        assert "thinking" in types
+
+    async def test_history_reread_after_restart_is_still_replay(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        """Undelivered history must not come back as live messages (TTS, tools)."""
+        monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", True)
+        first_run = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
+        assert first_run  # nothing delivered: every ticket is still held
+        monitor.state.save()  # what shutdown does
+
+        path = tmp_path / "session.jsonl"
+        with path.open("a") as f:
+            live = make_jsonl_entry(
+                "assistant",
+                [{"type": "tool_use", "id": "t9", "name": "Read", "input": {}}],
+            )
+            f.write(json.dumps(live) + "\n")
+
+        restarted = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+        monkeypatch.setattr(
+            restarted,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+        messages = await restarted.check_for_updates({"s"})
+
+        history, new = messages[:-1], messages[-1]
+        assert [m.text for m in history] == [m.text for m in first_run]
+        assert all(m.is_replay for m in history)
+        # Written after the replay caught up: live, so not compacted
+        assert new.content_type == "tool_use"
+        assert not new.is_replay
+
+    async def test_live_messages_are_never_compacted(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", True)
+        path = tmp_path / "session.jsonl"
+        self._write_history(path, make_jsonl_entry)
+        monitor.state.update_session(
+            TrackedSession(session_id="s", file_path=str(path))
+        )
+        monkeypatch.setattr(
+            monitor,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+        messages = await monitor.check_for_updates({"s"})  # not marked as replay
+
+        assert "tool_use" in [m.content_type for m in messages]

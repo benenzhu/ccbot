@@ -143,3 +143,76 @@ class TestSaveIfDirty:
         monkeypatch.setattr("ccbot.utils.atomic_write_json", fake_write)
         state.save_if_dirty()
         assert len(saved) == 0
+
+
+class TestDeliveryTickets:
+    def test_open_ticket_pins_resume_offset_until_released(self, tmp_path):
+        state = MonitorState(state_file=tmp_path / "state.json")
+        session = TrackedSession(session_id="s1", file_path="/a", last_byte_offset=500)
+        state.update_session(session)
+
+        early = state.open_ticket(session, 100)
+        late = state.open_ticket(session, 300)
+        assert session.resume_offset == 100
+        assert session.to_dict()["last_byte_offset"] == 100
+
+        early.release()
+        assert session.resume_offset == 300
+        late.release()
+        assert session.resume_offset == 500
+
+    def test_release_marks_state_dirty(self, tmp_path):
+        state = MonitorState(state_file=tmp_path / "state.json")
+        session = TrackedSession(session_id="s1", file_path="/a", last_byte_offset=500)
+        state.update_session(session)
+        ticket = state.open_ticket(session, 100)
+        state.save()
+        assert state._dirty is False
+
+        ticket.release()
+        assert state._dirty is True
+
+    def test_ticket_is_delivered_only_when_every_holder_released(self, tmp_path):
+        state = MonitorState(state_file=tmp_path / "state.json")
+        session = TrackedSession(session_id="s1", file_path="/a", last_byte_offset=500)
+        ticket = state.open_ticket(session, 100)
+        first, second = ticket.hold(), ticket.hold()
+
+        ticket.release()
+        first.release()
+        assert session.resume_offset == 100
+        second.release()
+        assert session.resume_offset == 500
+
+    def test_reseeded_session_is_not_held_back_by_old_tickets(self, tmp_path):
+        state = MonitorState(state_file=tmp_path / "state.json")
+        old = TrackedSession(session_id="s1", file_path="/a", last_byte_offset=500)
+        state.update_session(old)
+        stale = state.open_ticket(old, 100)
+
+        fresh = TrackedSession(session_id="s1", file_path="/a", last_byte_offset=900)
+        state.update_session(fresh)
+        assert fresh.resume_offset == 900
+        stale.release()
+        assert fresh.resume_offset == 900
+
+    def test_undelivered_is_not_persisted(self, tmp_path):
+        state = MonitorState(state_file=tmp_path / "state.json")
+        session = TrackedSession(session_id="s1", file_path="/a", last_byte_offset=500)
+        state.open_ticket(session, 100)
+        assert "undelivered" not in session.to_dict()
+
+    def test_replay_state_survives_a_restart(self, tmp_path):
+        state = MonitorState(state_file=tmp_path / "state.json")
+        session = TrackedSession(
+            session_id="s1", file_path="/a", last_byte_offset=500, replay_until=400
+        )
+        state.update_session(session)
+        state.save()
+
+        restored = MonitorState(state_file=tmp_path / "state.json")
+        restored.load()
+        loaded = restored.get_session("s1")
+        assert loaded is not None
+        assert loaded.is_replay(399)
+        assert not loaded.is_replay(400)

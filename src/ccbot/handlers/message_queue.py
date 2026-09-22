@@ -6,8 +6,16 @@ Provides a queue-based message processing system that ensures:
   - Consecutive content messages can be merged for efficiency
   - Thread-aware sending: each MessageTask carries an optional thread_id
     for Telegram topic support
+  - Nothing but status is dropped: a task that hits flood control or a
+    network error is retried in place until it goes through. Tasks are
+    consumed as they are sent (parts, tables, images), so a retry only sends
+    what is still missing. Delivery releases the task's DeliveryTickets,
+    which lets the monitor's persisted offset move past the message.
 
-Rate limiting is handled globally by AIORateLimiter on the Application.
+Rate limiting: AIORateLimiter on the Application handles the global limit and
+groups, but has no per-chat limiter for private chats. This module therefore
+paces every chat itself (_pace / _try_pace): content waits for a send slot,
+status is skipped when none is free.
 
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
@@ -29,6 +37,7 @@ from telegram.error import RetryAfter
 
 from ..config import config
 from ..markdown_v2 import ParsedTable, convert_markdown, table_to_markdown
+from ..monitor_state import DeliveryTicket
 from ..screenshot import render_table_image
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
@@ -37,6 +46,7 @@ from ..tts import prepare_tts_segments, synthesize_prepared
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
+    is_transient_error,
     send_photo,
     send_rich_markdown,
     send_with_fallback,
@@ -71,6 +81,15 @@ class MessageTask:
     # Markdown tables stripped from the text, sent after it as native
     # Telegram tables (PNG fallback). Each is (headers, rows).
     tables: list[ParsedTable] | None = None
+    # Receipts released once the task is delivered (or permanently failed),
+    # letting the monitor's persisted offset move past the source messages.
+    tickets: list[DeliveryTicket] = field(default_factory=list)
+    # Retry bookkeeping: the first part has been handled (status conversion
+    # must not run again), voice segments already sent, and how often the
+    # attachments/voice failed transiently.
+    started: bool = False
+    voice_sent: int = 0
+    upload_failures: int = 0
 
 
 # Per-user message queues and worker tasks
@@ -88,8 +107,53 @@ _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
 
-# Max seconds to wait for flood control before dropping tasks
+# Longest RetryAfter that is simply slept through. A longer ban also pauses
+# status traffic (_flood_until) while the content task waits it out.
 FLOOD_CONTROL_MAX_WAIT = 10
+
+# Transient network errors back off exponentially up to this many seconds
+RETRY_BACKOFF_MAX = 60.0
+
+# Telegram allows about one message per second per chat, with short bursts.
+# Going faster (a history replay easily produces 100+ messages a minute) earns
+# flood bans that grow to half an hour, during which nothing is delivered.
+CHAT_SEND_INTERVAL = 1.0  # sustained seconds per message to one chat
+CHAT_SEND_BURST = 3  # messages that may go out back to back
+
+# chat_id -> monotonic time the next non-burst send is due
+_chat_next_send: dict[int, float] = {}
+
+# Uploads (images, table PNGs, voice) get a bounded number of attempts: a
+# payload that always times out would otherwise block the queue forever, and
+# at-least-once replay would bring it right back after a restart.
+UPLOAD_MAX_ATTEMPTS = 5
+
+
+def _reserve_send_slot(chat_id: int, *, wait: bool) -> float | None:
+    """Book the next send slot for a chat.
+
+    Returns how long to sleep before sending. With wait=False, returns None
+    (booking nothing) when a slot isn't free right now.
+    """
+    now = time.monotonic()
+    due = max(_chat_next_send.get(chat_id, 0.0), now)
+    delay = due - now - (CHAT_SEND_BURST - 1) * CHAT_SEND_INTERVAL
+    if delay > 0 and not wait:
+        return None
+    _chat_next_send[chat_id] = due + CHAT_SEND_INTERVAL
+    return max(delay, 0.0)
+
+
+async def _pace(chat_id: int) -> None:
+    """Wait for this chat's next send slot (content, tables, images, voice)."""
+    delay = _reserve_send_slot(chat_id, wait=True)
+    if delay:
+        await asyncio.sleep(delay)
+
+
+def _try_pace(chat_id: int) -> bool:
+    """Take a send slot only if one is free now (status: skip, never wait)."""
+    return _reserve_send_slot(chat_id, wait=False) is not None
 
 
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
@@ -159,6 +223,7 @@ async def _merge_content_tasks(
     merged_parts = list(first.parts)
     merged_images: list[tuple[str, bytes]] = list(first.image_data or [])
     merged_tables: list[ParsedTable] = list(first.tables or [])
+    merged_tickets: list[DeliveryTicket] = list(first.tickets)
     current_length = sum(len(p) for p in merged_parts)
     merge_count = 0
 
@@ -182,6 +247,7 @@ async def _merge_content_tasks(
             merged_parts.extend(task.parts)
             merged_images.extend(task.image_data or [])
             merged_tables.extend(task.tables or [])
+            merged_tickets.extend(task.tickets)
             current_length += task_length
             merge_count += 1
 
@@ -205,6 +271,7 @@ async def _merge_content_tasks(
             thread_id=first.thread_id,
             image_data=merged_images or None,
             tables=merged_tables or None,
+            tickets=merged_tickets,
         ),
         merge_count,
     )
@@ -241,46 +308,24 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
 
                 if task.task_type == "content":
                     # Try to merge consecutive content tasks
-                    merged_task, merge_count = await _merge_content_tasks(
-                        queue, task, lock
-                    )
+                    task, merge_count = await _merge_content_tasks(queue, task, lock)
                     if merge_count > 0:
                         logger.debug(f"Merged {merge_count} tasks for user {user_id}")
                         # Mark merged tasks as done
                         for _ in range(merge_count):
                             queue.task_done()
-                    await _process_content_task(bot, user_id, merged_task)
-                elif task.task_type == "status_update":
-                    await _process_status_update_task(bot, user_id, task)
-                elif task.task_type == "status_clear":
-                    await _do_clear_status_message(bot, user_id, task.thread_id or 0)
-                elif task.task_type == "voice":
-                    await _process_voice_task(bot, user_id, task)
-                elif task.task_type == "table":
-                    await _process_table_task(bot, user_id, task)
-            except RetryAfter as e:
-                retry_secs = (
-                    e.retry_after
-                    if isinstance(e.retry_after, int)
-                    else int(e.retry_after.total_seconds())
-                )
-                if retry_secs > FLOOD_CONTROL_MAX_WAIT:
-                    _flood_until[user_id] = time.monotonic() + retry_secs
-                    logger.warning(
-                        "Flood control for user %d: retry_after=%ds, "
-                        "pausing queue until ban expires",
-                        user_id,
-                        retry_secs,
+                try:
+                    await _deliver_task(bot, user_id, task)
+                except Exception as e:
+                    # Permanent failure: retrying the same request can't help
+                    logger.error(
+                        f"Error processing message task for user {user_id}: {e}"
                     )
-                else:
-                    logger.warning(
-                        "Flood control for user %d: waiting %ds",
-                        user_id,
-                        retry_secs,
-                    )
-                    await asyncio.sleep(retry_secs)
-            except Exception as e:
-                logger.error(f"Error processing message task for user {user_id}: {e}")
+                # Delivered or permanently failed — either way this task no
+                # longer holds back the monitor offset. A cancelled task never
+                # gets here, so a restart re-sends it.
+                for ticket in task.tickets:
+                    ticket.release()
             finally:
                 queue.task_done()
         except asyncio.CancelledError:
@@ -288,6 +333,73 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
             break
         except Exception as e:
             logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
+
+
+def _retry_after_seconds(error: RetryAfter) -> int:
+    """Seconds Telegram asked us to wait (retry_after is int or timedelta)."""
+    retry_after = error.retry_after
+    if isinstance(retry_after, int):
+        return retry_after
+    return int(retry_after.total_seconds())
+
+
+async def _run_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Dispatch one task to its processor."""
+    if task.task_type == "content":
+        await _process_content_task(bot, user_id, task)
+    elif task.task_type == "status_update":
+        await _process_status_update_task(bot, user_id, task)
+    elif task.task_type == "status_clear":
+        await _do_clear_status_message(bot, user_id, task.thread_id or 0)
+    elif task.task_type == "voice":
+        await _process_voice_task(bot, user_id, task)
+    elif task.task_type == "table":
+        await _process_table_task(bot, user_id, task)
+
+
+async def _deliver_task(bot: Bot, user_id: int, task: MessageTask) -> None:
+    """Run a task, retrying transient failures until it is delivered.
+
+    Flood control (RetryAfter) waits as long as Telegram asks; network errors
+    back off exponentially. Status tasks are ephemeral: the next poll
+    supersedes them, so they get one attempt and are then dropped.
+    Permanent errors propagate to the caller.
+    """
+    ephemeral = task.task_type in ("status_update", "status_clear")
+    attempt = 0
+    while True:
+        try:
+            await _run_task(bot, user_id, task)
+            return
+        except Exception as e:
+            if not is_transient_error(e):
+                raise
+            flood = isinstance(e, RetryAfter)
+            if flood:
+                delay = float(_retry_after_seconds(e))
+                if delay > FLOOD_CONTROL_MAX_WAIT:
+                    # Long ban: keep status traffic off until it expires
+                    _flood_until[user_id] = time.monotonic() + delay
+            else:
+                delay = min(2.0**attempt, RETRY_BACKOFF_MAX)
+
+            if ephemeral:
+                logger.warning("Status dropped for user %d: %s", user_id, e)
+                # Still sit out a short ban so the next request isn't early
+                if flood and delay <= FLOOD_CONTROL_MAX_WAIT:
+                    await asyncio.sleep(delay)
+                return
+
+            attempt += 1
+            logger.warning(
+                "%s for user %d (%s): retry %d in %.0fs",
+                "Flood control" if flood else "Send failed",
+                user_id,
+                e,
+                attempt,
+                delay,
+            )
+            await asyncio.sleep(delay)
 
 
 def _send_kwargs(thread_id: int | None) -> dict[str, int]:
@@ -306,12 +418,14 @@ async def _send_task_images(bot: Bot, chat_id: int, task: MessageTask) -> None:
         len(task.image_data),
         task.thread_id,
     )
+    await _pace(chat_id)
     await send_photo(
         bot,
         chat_id,
         task.image_data,
         **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
     )
+    task.image_data = None  # sent — a retry must not send them again
 
 
 async def _send_table_as_image(
@@ -346,17 +460,19 @@ async def _send_task_tables(bot: Bot, chat_id: int, task: MessageTask) -> None:
         task.thread_id,
         config.native_tables,
     )
-    for table in task.tables:
-        if config.native_tables:
-            ok = await send_rich_markdown(
-                bot,
-                chat_id,
-                table_to_markdown(table),
-                **_send_kwargs(task.thread_id),
-            )
-            if ok:
-                continue
-        await _send_table_as_image(bot, chat_id, table, task.thread_id)
+    # Tables are popped as they go out, so a retry resumes at the failed one
+    while task.tables:
+        table = task.tables[0]
+        await _pace(chat_id)
+        ok = config.native_tables and await send_rich_markdown(
+            bot,
+            chat_id,
+            table_to_markdown(table),
+            **_send_kwargs(task.thread_id),
+        )
+        if not ok:
+            await _send_table_as_image(bot, chat_id, table, task.thread_id)
+        task.tables.pop(0)
 
 
 async def _process_table_task(bot: Bot, user_id: int, task: MessageTask) -> None:
@@ -370,10 +486,71 @@ async def _process_table_task(bot: Bot, user_id: int, task: MessageTask) -> None
     await _check_and_send_status(bot, user_id, task.window_id or "", task.thread_id)
 
 
+def _give_up_on_upload(task: MessageTask, error: Exception) -> bool:
+    """Count a transient upload failure; True once the attempts are used up.
+
+    Flood control doesn't count — Telegram says exactly when to come back.
+    """
+    if isinstance(error, RetryAfter) or not is_transient_error(error):
+        return False
+    task.upload_failures += 1
+    return task.upload_failures >= UPLOAD_MAX_ATTEMPTS
+
+
 async def _send_task_attachments(bot: Bot, chat_id: int, task: MessageTask) -> None:
     """Send everything that follows a task's text: tables, then images."""
-    await _send_task_tables(bot, chat_id, task)
-    await _send_task_images(bot, chat_id, task)
+    try:
+        await _send_task_tables(bot, chat_id, task)
+        await _send_task_images(bot, chat_id, task)
+    except Exception as e:
+        if not _give_up_on_upload(task, e):
+            raise
+        logger.error(
+            "Giving up on attachments in thread %s after %d attempts: %s",
+            task.thread_id,
+            task.upload_failures,
+            e,
+        )
+        task.tables = None
+        task.image_data = None
+
+
+async def _edit_tool_message(
+    bot: Bot, chat_id: int, message_id: int, task: MessageTask
+) -> bool:
+    """Edit a tool_use message in place to show its tool_result.
+
+    Returns False when the edit permanently fails (the caller then sends the
+    result as a new message). Transient errors are re-raised for a retry.
+    """
+    # Join all parts for editing (merged content goes together)
+    full_text = "\n\n".join(task.parts)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=_ensure_formatted(full_text),
+            parse_mode=PARSE_MODE,
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+        return True
+    except Exception as e:
+        if is_transient_error(e):
+            raise
+    try:
+        # Fallback: plain text with sentinels stripped
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=strip_sentinels(task.text or full_text),
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+        return True
+    except Exception as e:
+        if is_transient_error(e):
+            raise
+        logger.debug(f"Failed to edit tool msg {message_id}, sending new")
+        return False
 
 
 async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> None:
@@ -382,76 +559,56 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     tid = task.thread_id or 0
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
 
+    # The task is consumed as it is sent (parts, then tables and images), so
+    # when a transient error makes the worker run it again, only what is
+    # still missing goes out.
+
     # 1. Handle tool_result editing (merged parts are edited together)
-    if task.content_type == "tool_result" and task.tool_use_id:
+    if task.content_type == "tool_result" and task.tool_use_id and task.parts:
         _tkey = (task.tool_use_id, user_id, tid)
-        edit_msg_id = _tool_msg_ids.pop(_tkey, None)
+        # Looked up, not popped: a transient error must leave it for the retry
+        edit_msg_id = _tool_msg_ids.get(_tkey)
         if edit_msg_id is not None:
             # Clear status message first
             await _do_clear_status_message(bot, user_id, tid)
-            # Join all parts for editing (merged content goes together)
-            full_text = "\n\n".join(task.parts)
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=edit_msg_id,
-                    text=_ensure_formatted(full_text),
-                    parse_mode=PARSE_MODE,
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
-                await _send_task_attachments(bot, chat_id, task)
-                await _check_and_send_status(bot, user_id, wid, task.thread_id)
-                return
-            except RetryAfter:
-                raise
-            except Exception:
-                try:
-                    # Fallback: plain text with sentinels stripped
-                    plain_text = strip_sentinels(task.text or full_text)
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=edit_msg_id,
-                        text=plain_text,
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                    await _send_task_attachments(bot, chat_id, task)
-                    await _check_and_send_status(bot, user_id, wid, task.thread_id)
-                    return
-                except RetryAfter:
-                    raise
-                except Exception:
-                    logger.debug(f"Failed to edit tool msg {edit_msg_id}, sending new")
-                    # Fall through to send as new message
+            await _pace(chat_id)
+            if await _edit_tool_message(bot, chat_id, edit_msg_id, task):
+                task.parts = []
+            # Edited, or permanently failed and sent as a new message below
+            _tool_msg_ids.pop(_tkey, None)
 
     # 2. Send content messages, converting status message to first content part
-    first_part = True
     last_msg_id: int | None = None
-    for part in task.parts:
-        sent = None
+    while task.parts:
+        part = task.parts[0]
+        sent_msg_id: int | None = None
+        await _pace(chat_id)
 
         # For first part, try to convert status message to content (edit instead of delete)
-        if first_part:
-            first_part = False
-            converted_msg_id = await _convert_status_to_content(
+        if not task.started:
+            sent_msg_id = await _convert_status_to_content(
                 bot,
                 user_id,
                 tid,
                 wid,
                 part,
             )
-            if converted_msg_id is not None:
-                last_msg_id = converted_msg_id
-                continue
 
-        sent = await send_with_fallback(
-            bot,
-            chat_id,
-            part,
-            **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
-        )
+        if sent_msg_id is None:
+            sent = await send_with_fallback(
+                bot,
+                chat_id,
+                part,
+                raise_transient=True,
+                **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
+            )
+            if sent:
+                sent_msg_id = sent.message_id
 
-        if sent:
-            last_msg_id = sent.message_id
+        task.started = True
+        task.parts.pop(0)
+        if sent_msg_id is not None:
+            last_msg_id = sent_msg_id
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
@@ -497,10 +654,13 @@ async def _process_voice_task(bot: Bot, user_id: int, task: MessageTask) -> None
     synthesis instead of the whole reply. Segments are still *sent* in
     order. TTS failures are logged and swallowed — the text reply was
     already delivered, so a missing voice clip must never crash the worker.
+
+    Transient send errors are re-raised for a retry, which resumes after the
+    segments already delivered (task.voice_sent).
     """
     if not task.text:
         return
-    segments = prepare_tts_segments(task.text)
+    segments = prepare_tts_segments(task.text)[task.voice_sent :]
     if not segments:
         return
     if len(segments) > 1:
@@ -524,18 +684,21 @@ async def _process_voice_task(bot: Bot, user_id: int, task: MessageTask) -> None
             )
             audio = await current
             if audio is None:
+                task.voice_sent += 1
                 continue
             try:
+                await _pace(chat_id)
                 await bot.send_voice(
                     chat_id=chat_id,
                     voice=audio,
                     **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
                 )
-            except RetryAfter:
-                raise
             except Exception as e:
+                if is_transient_error(e) and not _give_up_on_upload(task, e):
+                    raise
                 logger.error("Failed to send voice message to %d: %s", user_id, e)
                 return
+            task.voice_sent += 1
     finally:
         # Don't leak an in-flight prefetch if we bailed out early
         if pending is not None and not pending.done():
@@ -570,33 +733,36 @@ async def _convert_status_to_content(
 
     # Edit status message to show content
     try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=_ensure_formatted(content_text),
-            parse_mode=PARSE_MODE,
-            link_preview_options=NO_LINK_PREVIEW,
-        )
-        return msg_id
-    except RetryAfter:
-        raise
-    except Exception:
         try:
-            # Fallback to plain text with sentinels stripped
-            plain = strip_sentinels(content_text)
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text=plain,
+                text=_ensure_formatted(content_text),
+                parse_mode=PARSE_MODE,
                 link_preview_options=NO_LINK_PREVIEW,
             )
             return msg_id
-        except RetryAfter:
-            raise
         except Exception as e:
-            logger.debug(f"Failed to convert status to content: {e}")
-            # Message might be deleted or too old, caller will send new message
-            return None
+            if is_transient_error(e):
+                raise
+        # Fallback to plain text with sentinels stripped
+        plain = strip_sentinels(content_text)
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=plain,
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+        return msg_id
+    except Exception as e:
+        if is_transient_error(e):
+            # The task will be retried: keep tracking the status message so
+            # the retry converts it instead of leaving it behind as an orphan
+            _status_msg_info[skey] = info
+            raise
+        logger.debug(f"Failed to convert status to content: {e}")
+        # Message might be deleted or too old, caller will send new message
+        return None
 
 
 async def _process_status_update_task(
@@ -615,6 +781,10 @@ async def _process_status_update_task(
         return
 
     current_info = _status_msg_info.get(skey)
+    if current_info and current_info[1] == wid and current_info[2] == status_text:
+        return  # Same content, nothing to send
+    if not _try_pace(chat_id):
+        return  # Chat is busy; the next poll brings a fresher status anyway
 
     if current_info:
         msg_id, stored_wid, last_text = current_info
@@ -744,7 +914,7 @@ async def _check_and_send_status(
 
     tid = thread_id or 0
     status_line = parse_status_line(pane_text)
-    if status_line:
+    if status_line and _try_pace(session_manager.resolve_chat_id(user_id, thread_id)):
         await _do_send_status_message(bot, user_id, tid, window_id, status_line)
 
 
@@ -759,8 +929,13 @@ async def enqueue_content_message(
     thread_id: int | None = None,
     image_data: list[tuple[str, bytes]] | None = None,
     tables: list[ParsedTable] | None = None,
+    ticket: DeliveryTicket | None = None,
 ) -> None:
-    """Enqueue a content message task."""
+    """Enqueue a content message task.
+
+    `ticket` is the source message's delivery receipt; the task holds a
+    reference until it has been sent.
+    """
     logger.debug(
         "Enqueue content: user=%d, window_id=%s, content_type=%s",
         user_id,
@@ -779,6 +954,7 @@ async def enqueue_content_message(
         thread_id=thread_id,
         image_data=image_data,
         tables=tables,
+        tickets=[ticket.hold()] if ticket else [],
     )
     queue.put_nowait(task)
 
@@ -789,6 +965,7 @@ async def enqueue_table_message(
     window_id: str,
     table: ParsedTable,
     thread_id: int | None = None,
+    ticket: DeliveryTicket | None = None,
 ) -> None:
     """Enqueue one table as its own message, preserving its position."""
     logger.debug("Enqueue table: user=%d, window_id=%s", user_id, window_id)
@@ -799,6 +976,7 @@ async def enqueue_table_message(
             window_id=window_id,
             thread_id=thread_id,
             tables=[table],
+            tickets=[ticket.hold()] if ticket else [],
         )
     )
 

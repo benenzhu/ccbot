@@ -6,6 +6,11 @@ Runs an async polling loop that:
   3. Reads new JSONL lines from each session file using byte-offset tracking.
   4. Parses entries via TranscriptParser and emits NewMessage objects to a callback.
 
+Delivery is at-least-once: every NewMessage carries a DeliveryTicket that pins
+the persisted offset at its JSONL line until the message has been sent.
+History replays are compacted (config.replay_compact): thinking and tool
+messages are dropped, each run of them replaced by one divider line.
+
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
 Key classes: SessionMonitor, NewMessage, SessionInfo.
@@ -21,12 +26,16 @@ from typing import Any, Callable, Awaitable
 import aiofiles
 
 from .config import config
-from .monitor_state import MonitorState, TrackedSession
+from .monitor_state import DeliveryTicket, MonitorState, TrackedSession
 from .tmux_manager import tmux_manager
 from .transcript_parser import TranscriptParser
 from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
+
+# Compact replay: content types dropped, and the line that stands in for them
+REPLAY_DROPPED_TYPES = frozenset({"thinking", "tool_use", "tool_result"})
+REPLAY_DIVIDER = "┄┄┄┄┄┄┄┄┄┄"
 
 
 @dataclass
@@ -50,6 +59,10 @@ class NewMessage:
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
     is_replay: bool = False  # True when replaying past history (e.g. --resume)
+    # Pins the persisted offset until this message is delivered. Whoever
+    # queues the message takes a hold(); the monitor releases its own
+    # reference once the callback returns.
+    ticket: DeliveryTicket | None = None
 
 
 class SessionMonitor:
@@ -85,9 +98,9 @@ class SessionMonitor:
         self._last_session_map: dict[str, str] = {}  # window_key -> session_id
         # In-memory mtime cache for quick file change detection (not persisted)
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
-        # Sessions whose offset was rewound to replay old history. Messages
-        # read from these are flagged is_replay until the offset reaches EOF.
-        self._replay_sessions: set[str] = set()
+        # Replaying sessions currently inside a run of dropped blocks (the
+        # divider for that run has already been emitted).
+        self._replay_gap_open: set[str] = set()
         # Forks copy messages with their original UUIDs but rewrite the JSONL,
         # so a source byte offset cannot be used to skip inherited history.
         self._fork_history_uuids: dict[str, set[str]] = {}
@@ -106,8 +119,18 @@ class SessionMonitor:
         self._fork_history_uuids[session_id] = uuids
 
     def mark_replay(self, session_id: str) -> None:
-        """Flag a session as replaying history (suppresses TTS downstream)."""
-        self._replay_sessions.add(session_id)
+        """Flag a tracked session as replaying history.
+
+        Messages read from it are flagged is_replay (compact, no TTS) until
+        the offset first reaches EOF. Persisted with the session, so it
+        survives a restart in the middle of the replay.
+        """
+        tracked = self.state.get_session(session_id)
+        if tracked is None:
+            logger.warning("mark_replay: session %s is not tracked", session_id)
+            return
+        tracked.replaying = True
+        self.state.update_session(tracked)
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -220,13 +243,25 @@ class SessionMonitor:
     async def _read_new_lines(
         self, session: TrackedSession, file_path: Path
     ) -> list[dict]:
+        """Read new lines from a session file (entries only, see below)."""
+        return [
+            data
+            for _, data in await self._read_new_lines_with_offsets(session, file_path)
+        ]
+
+    async def _read_new_lines_with_offsets(
+        self, session: TrackedSession, file_path: Path
+    ) -> list[tuple[int, dict]]:
         """Read new lines from a session file using byte offset for efficiency.
+
+        Returns (line_start_offset, entry) pairs so each message can pin the
+        persisted offset at its own line until it is delivered.
 
         Detects file truncation (e.g. after /clear) and resets offset.
         Recovers from corrupted offsets (mid-line) by scanning to next line.
         Retries incomplete writes, but skips malformed newline-terminated records.
         """
-        new_entries = []
+        new_entries: list[tuple[int, dict]] = []
         try:
             # Read bytes so an incomplete UTF-8 character at EOF cannot prevent
             # decoding earlier, complete records in the same buffered read.
@@ -275,7 +310,7 @@ class SessionMonitor:
                         data = None
                     if isinstance(data, dict):
                         if data:
-                            new_entries.append(data)
+                            new_entries.append((safe_offset, data))
                     elif line.strip():
                         if not line.endswith(b"\n"):
                             logger.debug(
@@ -357,29 +392,32 @@ class SessionMonitor:
 
                 # Replay state is captured before the read: everything in this
                 # batch is old history, so it must not be spoken aloud.
-                is_replay = session_info.session_id in self._replay_sessions
+                was_replaying = tracked.replaying
 
                 # File changed, read new content from last offset
                 previous_offset = tracked.last_byte_offset
-                new_entries = await self._read_new_lines(
+                new_lines = await self._read_new_lines_with_offsets(
                     tracked, session_info.file_path
                 )
                 self._file_mtimes[session_info.session_id] = current_mtime
 
                 inherited = self._fork_history_uuids.get(session_info.session_id)
                 if inherited is not None:
-                    new_entries = [
-                        entry
-                        for entry in new_entries
+                    new_lines = [
+                        (offset, entry)
+                        for offset, entry in new_lines
                         if entry.get("uuid") not in inherited
                     ]
                     # Keep the filter across partial writes of the copied
                     # transcript, until the first new conversation message.
                     if any(
                         entry.get("type") in ("user", "assistant") and entry.get("uuid")
-                        for entry in new_entries
+                        for _, entry in new_lines
                     ):
                         self._fork_history_uuids.pop(session_info.session_id, None)
+
+                line_offsets = [offset for offset, _ in new_lines]
+                new_entries = [entry for _, entry in new_lines]
 
                 if new_entries:
                     logger.debug(
@@ -404,24 +442,55 @@ class SessionMonitor:
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
+
+                    line_offset = (
+                        line_offsets[entry.source_index]
+                        if 0 <= entry.source_index < len(line_offsets)
+                        else previous_offset
+                    )
+                    # Also true for history re-read after a restart
+                    is_replay = was_replaying or tracked.is_replay(line_offset)
+
+                    text = entry.text
+                    content_type = entry.content_type
+                    dropped = (
+                        is_replay
+                        and config.replay_compact
+                        and content_type in REPLAY_DROPPED_TYPES
+                    )
+                    if dropped:
+                        # One divider stands in for the whole run
+                        if session_info.session_id in self._replay_gap_open:
+                            continue
+                        self._replay_gap_open.add(session_info.session_id)
+                        text, content_type = REPLAY_DIVIDER, "text"
+                    else:
+                        self._replay_gap_open.discard(session_info.session_id)
+
+                    # The ticket pins the saved offset at this message's line
+                    # until it is delivered (opened before the save below).
                     new_messages.append(
                         NewMessage(
                             session_id=session_info.session_id,
-                            text=entry.text,
+                            text=text,
                             is_complete=True,
-                            content_type=entry.content_type,
-                            tool_use_id=entry.tool_use_id,
-                            role=entry.role,
-                            tool_name=entry.tool_name,
-                            image_data=entry.image_data,
+                            content_type=content_type,
+                            tool_use_id=None if dropped else entry.tool_use_id,
+                            role="assistant" if dropped else entry.role,
+                            tool_name=None if dropped else entry.tool_name,
+                            image_data=None if dropped else entry.image_data,
                             is_replay=is_replay,
+                            ticket=self.state.open_ticket(tracked, line_offset),
                         )
                     )
 
                 # Replay ends once we've caught up with the file; a long
                 # history may take several cycles (partial lines, growth).
-                if is_replay and tracked.last_byte_offset >= current_size:
-                    self._replay_sessions.discard(session_info.session_id)
+                if was_replaying and tracked.last_byte_offset >= current_size:
+                    tracked.replaying = False
+                    tracked.replay_until = tracked.last_byte_offset
+                    self.state.update_session(tracked)
+                    self._replay_gap_open.discard(session_info.session_id)
 
                 if tracked.last_byte_offset != previous_offset:
                     self.state.update_session(tracked)
@@ -559,11 +628,16 @@ class SessionMonitor:
                     status = "complete" if msg.is_complete else "streaming"
                     preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
                     logger.info("[%s] session=%s: %s", status, msg.session_id, preview)
-                    if self._message_callback:
-                        try:
+                    try:
+                        if self._message_callback:
                             await self._message_callback(msg)
-                        except Exception as e:
-                            logger.error(f"Message callback error: {e}")
+                    except Exception as e:
+                        logger.error(f"Message callback error: {e}")
+                    finally:
+                        # Queued tasks hold their own references; a message
+                        # nobody queued counts as delivered right here.
+                        if msg.ticket:
+                            msg.ticket.release()
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")

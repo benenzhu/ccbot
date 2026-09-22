@@ -317,6 +317,31 @@ class TestFormatToolResultText:
 
 
 class TestParseEntries:
+    def test_source_index_points_at_the_entry_that_produced_each_message(
+        self,
+        make_jsonl_entry,
+        make_text_block,
+        make_tool_use_block,
+        make_tool_result_block,
+    ):
+        entries = [
+            {"type": "summary", "summary": "not a message"},
+            make_jsonl_entry(
+                "assistant",
+                [make_text_block("Reading"), make_tool_use_block("t1", "Read")],
+            ),
+            make_jsonl_entry("user", [make_tool_result_block("t1", "contents")]),
+            make_jsonl_entry("assistant", [make_text_block("Done")]),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries, pending_tools={})
+
+        assert [(e.content_type, e.source_index) for e in result] == [
+            ("text", 1),
+            ("tool_use", 1),
+            ("tool_result", 2),
+            ("text", 3),
+        ]
+
     def test_assistant_text(self, make_jsonl_entry, make_text_block):
         entries = [make_jsonl_entry("assistant", [make_text_block("Hello!")])]
         result, pending = TranscriptParser.parse_entries(entries)

@@ -22,7 +22,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
-- **Rate limiting** — `AIORateLimiter(max_retries=5)` on the Application (30/s global). On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
+- **Rate limiting** — `AIORateLimiter(overall_max_rate=1, overall_time_period=2.2, max_retries=5)` on the Application: one request per 2.2s bot-wide, because all topics share one private chat. On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
 
 ## Code Conventions
 

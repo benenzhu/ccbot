@@ -10,7 +10,7 @@ Provides background polling of terminal status lines for all active users:
     + unbinds thread)
 
 Key components:
-  - STATUS_POLL_INTERVAL: Polling frequency (1 second)
+  - STATUS_POLL_INTERVAL: Polling frequency (5 seconds)
   - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
@@ -37,7 +37,7 @@ from .message_queue import enqueue_status_update, get_message_queue
 logger = logging.getLogger(__name__)
 
 # Status polling interval
-STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send layer)
+STATUS_POLL_INTERVAL = 5.0  # seconds - keep status edits from eating the send quota
 
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds

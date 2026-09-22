@@ -19,16 +19,16 @@ Per-user message queues + worker pattern for all send tasks:
 - When a status message exists, the first content message updates it via edit
 - Subsequent content messages are sent as new messages
 
-**Polling**: Background task polls terminal status for all active windows at 1-second intervals. Send-layer rate limiting ensures flood control is not triggered.
+**Polling**: Background task polls terminal status for all active windows at 5-second intervals, so status edits use only a small share of the send quota.
 
 **Deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
 
 ## Rate Limiting
 
-- `AIORateLimiter(max_retries=5)` on the Application (30/s global)
+- `AIORateLimiter(overall_max_rate=1, overall_time_period=2.2, max_retries=5)` on the Application: one request per 2.2s bot-wide (every topic lives in one private chat, which AIORateLimiter otherwise leaves unlimited)
 - On 429, AIORateLimiter pauses all concurrent requests (`_retry_after_event`) and retries after the ban
 - On restart, the global bucket is pre-filled (`_level=max_rate`) to avoid burst against Telegram's persisted server-side counter
-- Status polling interval: 1 second (skips enqueue when queue is non-empty)
+- Status polling interval: 5 seconds (skips enqueue when queue is non-empty)
 
 ## Performance Optimizations
 

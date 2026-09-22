@@ -16,7 +16,7 @@ import difflib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,10 @@ class ParsedEntry:
     image_data: list[tuple[str, bytes]] | None = (
         None  # For tool_result entries with images: (media_type, raw_bytes)
     )
+    # Index into the `entries` list passed to parse_entries that produced
+    # this entry (-1 if none). Lets the monitor map a message back to the
+    # byte offset of its JSONL line.
+    source_index: int = field(default=-1, compare=False)
 
 
 @dataclass
@@ -438,7 +442,13 @@ class TranscriptParser:
         else:
             pending_tools = dict(pending_tools)  # don't mutate caller's dict
 
-        for data in entries:
+        tagged = 0  # result[:tagged] already carry their source_index
+        for index, data in enumerate(entries):
+            # Whatever the previous iteration appended came from its entry
+            for entry in result[tagged:]:
+                entry.source_index = index - 1
+            tagged = len(result)
+
             msg_type = cls.get_message_type(data)
             if msg_type not in ("user", "assistant"):
                 continue
@@ -739,6 +749,9 @@ class TranscriptParser:
                                 timestamp=entry_timestamp,
                             )
                         )
+
+        for entry in result[tagged:]:
+            entry.source_index = len(entries) - 1
 
         # Flush remaining pending tools at end.
         # In carry-over mode (monitor), keep them pending for the next call

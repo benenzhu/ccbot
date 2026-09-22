@@ -103,6 +103,13 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Compact history replay (resume with replay): drop thinking and tool
+        # call messages, leaving one divider line per run of dropped blocks.
+        # When False, the replay sends the full transcript.
+        self.replay_compact = (
+            os.getenv("CCBOT_REPLAY_COMPACT", "true").lower() != "false"
+        )
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"

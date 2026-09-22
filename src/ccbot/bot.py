@@ -1283,7 +1283,6 @@ async def _create_and_bind_window(
             session_monitor.state.remove_session(fork_session_id)
             session_monitor.state.save()
             session_monitor._fork_history_uuids.pop(fork_session_id, None)
-            session_monitor._replay_sessions.discard(fork_session_id)
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
@@ -2057,7 +2056,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if msg.is_complete and segments:
             for seg in segments:
                 if isinstance(seg, tuple):
-                    await enqueue_table_message(bot, user_id, wid, seg, thread_id)
+                    await enqueue_table_message(
+                        bot, user_id, wid, seg, thread_id, ticket=msg.ticket
+                    )
                     continue
                 await enqueue_content_message(
                     bot=bot,
@@ -2070,6 +2071,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     content_type=msg.content_type,
                     text=seg,
                     thread_id=thread_id,
+                    ticket=msg.ticket,
                 )
         elif msg.is_complete:
             parts = build_response_parts(
@@ -2089,6 +2091,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 thread_id=thread_id,
                 image_data=list(msg.image_data) if msg.image_data else None,
                 tables=tables or None,
+                ticket=msg.ticket,
             )
 
         if msg.is_complete:
@@ -2136,9 +2139,9 @@ async def post_init(application: Application) -> None:
     # Pre-fill global rate limiter bucket on restart.
     # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
     # server-side counter persists across bot restarts.  Setting _level=max_rate
-    # forces the bucket to start "full" so capacity drains in naturally (~1s).
-    # AIORateLimiter has no per-private-chat limiter, so max_retries is the
-    # primary protection (retry + pause all concurrent requests on 429).
+    # forces the bucket to start "full" so the first send waits one period.
+    # max_retries adds a second layer: on 429 all concurrent requests pause
+    # until the ban lifts, then the request is retried.
     rate_limiter = application.bot.rate_limiter
     if rate_limiter and rate_limiter._base_limiter:
         rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
@@ -2187,7 +2190,14 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        # One request every 2.2s across the whole bot. Telegram only
+        # tolerates ~1 msg/s per chat and every topic here lives in one
+        # private chat, which AIORateLimiter otherwise leaves unlimited.
+        .rate_limiter(
+            AIORateLimiter(
+                overall_max_rate=1, overall_time_period=2.2, max_retries=5
+            )
+        )
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()

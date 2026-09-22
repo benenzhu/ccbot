@@ -14,7 +14,11 @@ Functions:
   - safe_send: Send message with formatting, fallback to plain text
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
-RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
+Transient failures (RetryAfter, timeouts, network errors — see
+is_transient_error) are re-raised from the queue-facing paths
+(send_with_fallback(raise_transient=True), send_photo, send_rich_markdown) so
+the queue worker can retry instead of losing the message. Only permanent
+failures (bad request, forbidden, ...) fall back to plain text or give up.
 """
 
 import io
@@ -22,7 +26,7 @@ import logging
 from typing import Any
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
@@ -48,6 +52,19 @@ def _ensure_formatted(text: str) -> str:
 PARSE_MODE = "MarkdownV2"
 
 
+def is_transient_error(error: BaseException) -> bool:
+    """True for failures worth retrying: rate limits and network trouble.
+
+    BadRequest subclasses NetworkError in python-telegram-bot but means the
+    request itself is wrong, so retrying it unchanged can never succeed.
+    """
+    if isinstance(error, RetryAfter):
+        return True
+    if isinstance(error, BadRequest):
+        return False
+    return isinstance(error, NetworkError)  # includes TimedOut
+
+
 # Disable link previews in all messages to reduce visual noise
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -56,13 +73,23 @@ async def send_with_fallback(
     bot: Bot,
     chat_id: int,
     text: str,
+    *,
+    raise_transient: bool = False,
     **kwargs: Any,
 ) -> Message | None:
     """Send message with MarkdownV2, falling back to plain text on failure.
 
     Returns the sent Message on success, None on failure.
-    RetryAfter is re-raised for caller handling.
+    RetryAfter is always re-raised for caller handling. With
+    raise_transient=True (queue worker) so is every transient error, so a
+    network blip leads to a retry instead of a lost message.
     """
+
+    def must_raise(error: Exception) -> bool:
+        if isinstance(error, RetryAfter):
+            return True
+        return raise_transient and is_transient_error(error)
+
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
         return await bot.send_message(
@@ -71,16 +98,16 @@ async def send_with_fallback(
             parse_mode=PARSE_MODE,
             **kwargs,
         )
-    except RetryAfter:
-        raise
-    except Exception:
+    except Exception as e:
+        if must_raise(e):
+            raise
         try:
             return await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs
             )
-        except RetryAfter:
-            raise
         except Exception as e:
+            if must_raise(e):
+                raise
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
 
@@ -121,9 +148,9 @@ async def send_photo(
                 media=media,
                 **kwargs,
             )
-    except RetryAfter:
-        raise
     except Exception as e:
+        if is_transient_error(e):
+            raise
         logger.error("Failed to send photo to %d: %s", chat_id, e)
 
 
@@ -139,8 +166,8 @@ async def send_rich_markdown(
     through Bot.do_api_request, which still passes ExtBot's rate limiter.
     Rich Markdown is GitHub-flavored: pipe tables render as native tables.
 
-    Returns True on success, False on any non-rate-limit failure.
-    RetryAfter is re-raised for caller handling.
+    Returns True on success, False on permanent failure (caller falls back
+    to PNG). Transient errors are re-raised so the caller can retry.
     """
     api_kwargs: dict[str, Any] = {
         "chat_id": chat_id,
@@ -150,9 +177,9 @@ async def send_rich_markdown(
     try:
         await bot.do_api_request("sendRichMessage", api_kwargs=api_kwargs)
         return True
-    except RetryAfter:
-        raise
     except Exception as e:
+        if is_transient_error(e):
+            raise
         logger.warning("Failed to send rich message to %d: %s", chat_id, e)
         return False
 

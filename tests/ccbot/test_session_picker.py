@@ -318,7 +318,7 @@ async def test_fork_binds_new_id_and_preserves_source(
     assert mgr.get_window_state("@1").session_id == "source"
     assert mgr.get_window_state("@2").session_id == target_id
     assert source.read_bytes() == original
-    assert (target_id in monitor._replay_sessions) == replay
+    assert monitor.state.get_session(target_id).replaying == replay
     if replay:
         send.assert_not_awaited()
     else:

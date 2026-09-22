@@ -1,13 +1,23 @@
-"""Unit tests for message_queue — voice task retry and segmentation behavior."""
+"""Unit tests for message_queue — voice, tables, merging, and retry-until-delivered."""
 
 import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from ccbot.handlers import message_queue
 from ccbot.handlers.message_queue import MessageTask, _process_voice_task
+from ccbot.monitor_state import DeliveryTicket
 from ccbot.tts import TtsApiError
+
+
+@pytest.fixture(autouse=True)
+def _fresh_chat_pacing():
+    """Every test starts with all per-chat send slots free."""
+    message_queue._chat_next_send.clear()
+    yield
+    message_queue._chat_next_send.clear()
 
 
 def _voice_task(text: str = "你好") -> MessageTask:
@@ -163,6 +173,7 @@ async def test_voice_prefetch_overlaps_synthesis():
         patch.object(
             message_queue.session_manager, "resolve_chat_id", return_value=100
         ),
+        patch.object(message_queue, "_pace", AsyncMock()),  # timing is about TTS
     ):
         loop = asyncio.get_running_loop()
         start = loop.time()
@@ -325,3 +336,332 @@ async def test_enqueue_table_message_creates_table_task():
     assert task.window_id == "@1"
     assert task.thread_id == 42
     assert task.tables == [(["h"], [["v"]])]
+
+
+# --- Nothing but status is dropped: transient failures are retried ---
+
+
+def _ticket() -> tuple[DeliveryTicket, list[str]]:
+    """A ticket whose opener already let go, plus its delivery log."""
+    delivered: list[str] = []
+    ticket = DeliveryTicket(lambda: delivered.append("delivered"))
+    held = ticket.hold()
+    ticket.release()
+    return held, delivered
+
+
+def _content_patches(send: AsyncMock):
+    return (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "send_with_fallback", send),
+        patch.object(message_queue, "_check_and_send_status", AsyncMock()),
+        patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock),
+    )
+
+
+async def test_flood_control_retries_content_instead_of_dropping_it():
+    bot = AsyncMock()
+    task = MessageTask(task_type="content", window_id="@1", parts=["hello"])
+    send = AsyncMock(side_effect=[RetryAfter(30), AsyncMock(message_id=9)])
+    resolve, fallback, status, sleep = _content_patches(send)
+    with resolve, fallback, status, sleep as slept:
+        await message_queue._deliver_task(bot, 5, task)
+
+    assert send.await_count == 2
+    slept.assert_awaited_once_with(30.0)
+    assert task.parts == []
+    message_queue._flood_until.pop(5, None)
+
+
+async def test_network_error_retries_only_the_parts_still_missing():
+    bot = AsyncMock()
+    task = MessageTask(task_type="content", window_id="@1", parts=["one", "two"])
+    send = AsyncMock(
+        side_effect=[
+            AsyncMock(message_id=1),
+            TimedOut(),
+            NetworkError("connection reset"),
+            AsyncMock(message_id=2),
+        ]
+    )
+    resolve, fallback, status, sleep = _content_patches(send)
+    pace = patch.object(message_queue, "_pace", AsyncMock())  # backoff only
+    with resolve, fallback, status, pace, sleep as slept:
+        await message_queue._deliver_task(bot, 5, task)
+
+    sent = [call.args[2] for call in send.await_args_list]
+    assert sent == ["one", "two", "two", "two"]  # "one" is never sent twice
+    assert [call.args[0] for call in slept.await_args_list] == [1.0, 2.0]
+    assert all(call.kwargs["raise_transient"] for call in send.await_args_list)
+
+
+async def test_permanent_error_propagates_without_retry():
+    bot = AsyncMock()
+    task = MessageTask(task_type="content", window_id="@1", parts=["hello"])
+    send = AsyncMock(side_effect=BadRequest("chat not found"))
+    resolve, fallback, status, sleep = _content_patches(send)
+    with resolve, fallback, status, sleep, pytest.raises(BadRequest):
+        await message_queue._deliver_task(bot, 5, task)
+
+    send.assert_awaited_once()
+
+
+async def test_status_task_is_dropped_on_flood_control():
+    bot = AsyncMock()
+    task = MessageTask(task_type="status_update", window_id="@1", text="Working…")
+    with (
+        patch.object(
+            message_queue,
+            "_process_status_update_task",
+            AsyncMock(side_effect=RetryAfter(300)),
+        ) as process,
+        patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock) as slept,
+    ):
+        await message_queue._deliver_task(bot, 6, task)
+
+    process.assert_awaited_once()
+    slept.assert_not_awaited()
+    assert message_queue._flood_until.pop(6) > 0  # status traffic paused
+
+
+async def test_retry_after_failed_edit_keeps_tool_message_id():
+    bot = AsyncMock()
+    bot.edit_message_text.side_effect = [RetryAfter(3), None]
+    message_queue._tool_msg_ids[("tool-1", 5, 0)] = 1234
+    task = MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["result"],
+        tool_use_id="tool-1",
+        content_type="tool_result",
+    )
+    send = AsyncMock()
+    resolve, fallback, status, sleep = _content_patches(send)
+    with resolve, fallback, status, sleep:
+        await message_queue._deliver_task(bot, 5, task)
+
+    # Second attempt still edited the tool_use message instead of sending anew
+    assert bot.edit_message_text.await_count == 2
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 1234
+    send.assert_not_awaited()
+    assert ("tool-1", 5, 0) not in message_queue._tool_msg_ids
+
+
+async def test_attachments_are_not_resent_on_retry():
+    bot = AsyncMock()
+    task = MessageTask(
+        task_type="content",
+        window_id="@1",
+        parts=["text"],
+        image_data=[("image/png", b"png")],
+    )
+    send = AsyncMock(return_value=AsyncMock(message_id=1))
+    status = AsyncMock(side_effect=[RetryAfter(2), None])
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "send_with_fallback", send),
+        patch.object(message_queue, "send_photo", AsyncMock()) as photo,
+        patch.object(message_queue, "_check_and_send_status", status),
+        patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock),
+    ):
+        await message_queue._deliver_task(bot, 5, task)
+
+    send.assert_awaited_once()
+    photo.assert_awaited_once()
+    assert status.await_count == 2
+
+
+async def test_upload_that_keeps_timing_out_is_given_up():
+    bot = AsyncMock()
+    task = MessageTask(
+        task_type="content",
+        window_id="@1",
+        thread_id=42,
+        image_data=[("image/png", b"png")],
+    )
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(
+            message_queue, "send_photo", AsyncMock(side_effect=TimedOut())
+        ) as photo,
+        patch.object(message_queue, "_check_and_send_status", AsyncMock()),
+        patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock),
+    ):
+        await message_queue._deliver_task(bot, 5, task)
+
+    assert photo.await_count == message_queue.UPLOAD_MAX_ATTEMPTS
+    assert task.image_data is None
+
+
+async def test_worker_releases_tickets_after_delivery_not_before():
+    bot = AsyncMock()
+    held, delivered = _ticket()
+    gate = asyncio.Event()
+
+    async def slow_send(*_args, **_kwargs):
+        await gate.wait()
+        return AsyncMock(message_id=1)
+
+    resolve, fallback, status, _sleep = _content_patches(
+        AsyncMock(side_effect=slow_send)
+    )
+    with resolve, fallback, status:
+        queue = message_queue.get_or_create_queue(bot, 4242)
+        try:
+            queue.put_nowait(
+                MessageTask(
+                    task_type="content", window_id="@1", parts=["x"], tickets=[held]
+                )
+            )
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert delivered == []  # queued / in flight: offset stays pinned
+            gate.set()
+            await queue.join()
+            assert delivered == ["delivered"]
+        finally:
+            message_queue._queue_workers.pop(4242).cancel()
+            message_queue._message_queues.pop(4242, None)
+            message_queue._queue_locks.pop(4242, None)
+
+
+async def test_cancelled_worker_keeps_ticket_so_restart_resends():
+    bot = AsyncMock()
+    held, delivered = _ticket()
+
+    async def never_sent(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    resolve, fallback, status, _sleep = _content_patches(
+        AsyncMock(side_effect=never_sent)
+    )
+    with resolve, fallback, status:
+        queue = message_queue.get_or_create_queue(bot, 4343)
+        queue.put_nowait(
+            MessageTask(
+                task_type="content", window_id="@1", parts=["x"], tickets=[held]
+            )
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        worker = message_queue._queue_workers.pop(4343)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        message_queue._message_queues.pop(4343, None)
+        message_queue._queue_locks.pop(4343, None)
+
+    assert delivered == []
+
+
+async def test_merge_carries_tickets_from_all_tasks():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    first_ticket, _ = _ticket()
+    second_ticket, _ = _ticket()
+    first = MessageTask(
+        task_type="content", window_id="@1", parts=["a"], tickets=[first_ticket]
+    )
+    queue.put_nowait(
+        MessageTask(
+            task_type="content", window_id="@1", parts=["b"], tickets=[second_ticket]
+        )
+    )
+
+    merged, _count = await message_queue._merge_content_tasks(
+        queue, first, asyncio.Lock()
+    )
+
+    assert merged.tickets == [first_ticket, second_ticket]
+
+
+async def test_enqueue_content_holds_the_message_ticket():
+    bot = AsyncMock()
+    delivered: list[str] = []
+    ticket = DeliveryTicket(lambda: delivered.append("delivered"))
+    with patch.object(message_queue, "get_or_create_queue") as goc:
+        q: asyncio.Queue[MessageTask] = asyncio.Queue()
+        goc.return_value = q
+        await message_queue.enqueue_content_message(
+            bot, 5, "@1", ["part"], ticket=ticket
+        )
+
+    ticket.release()  # the monitor lets go once the callback returns
+    assert delivered == []
+    q.get_nowait().tickets[0].release()
+    assert delivered == ["delivered"]
+
+
+# --- Per-chat pacing: Telegram bans chats that get more than ~1 message/s ---
+
+
+async def test_pacing_allows_a_burst_then_one_message_per_interval():
+    with (
+        patch.object(message_queue.time, "monotonic", return_value=1000.0),
+        patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock) as slept,
+    ):
+        for _ in range(message_queue.CHAT_SEND_BURST + 3):
+            await message_queue._pace(777)
+
+    assert [call.args[0] for call in slept.await_args_list] == [1.0, 2.0, 3.0]
+
+
+async def test_pacing_is_per_chat_and_recovers_when_idle():
+    clock = patch.object(message_queue.time, "monotonic", return_value=1000.0)
+    with clock as now:
+        for _ in range(message_queue.CHAT_SEND_BURST):
+            assert message_queue._try_pace(777)
+        assert not message_queue._try_pace(777)  # burst used up
+        assert message_queue._try_pace(888)  # another chat is unaffected
+
+        now.return_value += message_queue.CHAT_SEND_INTERVAL
+        assert message_queue._try_pace(777)  # one slot per interval comes back
+
+
+async def test_replay_sized_backlog_is_spread_out_not_blasted():
+    bot = AsyncMock()
+    task = MessageTask(
+        task_type="content", window_id="@1", parts=[f"msg {i}" for i in range(10)]
+    )
+    send = AsyncMock(return_value=AsyncMock(message_id=1))
+    resolve, fallback, status, sleep = _content_patches(send)
+    with (
+        patch.object(message_queue.time, "monotonic", return_value=1000.0),
+        resolve,
+        fallback,
+        status,
+        sleep as slept,
+    ):
+        await message_queue._deliver_task(bot, 5, task)
+
+    assert send.await_count == 10
+    # 3 go out at once, the other 7 are each booked one interval later
+    assert [call.args[0] for call in slept.await_args_list] == [
+        float(n) for n in range(1, 8)
+    ]
+
+
+async def test_status_update_is_skipped_while_chat_has_no_free_slot():
+    bot = AsyncMock()
+    task = MessageTask(
+        task_type="status_update", window_id="@1", text="Working…", thread_id=42
+    )
+    with (
+        patch.object(message_queue.time, "monotonic", return_value=1000.0),
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "_do_send_status_message", AsyncMock()) as send,
+    ):
+        for _ in range(message_queue.CHAT_SEND_BURST):
+            message_queue._try_pace(777)
+        await message_queue._process_status_update_task(bot, 5, task)
+        send.assert_not_awaited()
+
+        message_queue._chat_next_send.clear()
+        await message_queue._process_status_update_task(bot, 5, task)
+        send.assert_awaited_once()
