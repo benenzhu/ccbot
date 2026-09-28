@@ -72,6 +72,8 @@ Additional modules:
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py             ─ CLI entry point
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
+  request_log.py      ─ One log line per Telegram API request (LoggingRateLimiter);
+                        scripts/api_log.py turns them into a traffic report
 
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send

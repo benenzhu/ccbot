@@ -5,12 +5,22 @@ from unittest.mock import AsyncMock
 import pytest
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
+from ccbot.handlers import message_sender
 from ccbot.handlers.message_sender import (
+    is_topic_gone,
+    is_topic_gone_error,
     is_transient_error,
     send_photo,
     send_rich_markdown,
     send_with_fallback,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_gone_topics():
+    message_sender._gone_topics.clear()
+    yield
+    message_sender._gone_topics.clear()
 
 
 @pytest.mark.parametrize(
@@ -86,3 +96,44 @@ async def test_send_rich_markdown_raises_transient_and_reports_permanent():
 
     bot.do_api_request.side_effect = BadRequest("method not found")
     assert await send_rich_markdown(bot, 1, "| a |") is False
+
+
+# --- Deleted topics: Telegram sends no update, the first send finds out ---
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        pytest.param(BadRequest("Message thread not found"), True, id="thread"),
+        pytest.param(BadRequest("Bad Request: TOPIC_ID_INVALID"), True, id="topic"),
+        pytest.param(BadRequest("chat not found"), False, id="chat"),
+        pytest.param(NetworkError("message thread not found"), False, id="network"),
+    ],
+)
+def test_is_topic_gone_error(error: Exception, expected: bool):
+    assert is_topic_gone_error(error) is expected
+
+
+async def test_send_to_deleted_topic_marks_it_and_skips_plain_text_retry():
+    bot = AsyncMock()
+    bot.send_message.side_effect = BadRequest("Message thread not found")
+
+    sent = await send_with_fallback(
+        bot, 777, "hello", raise_transient=True, message_thread_id=42
+    )
+
+    assert sent is None
+    bot.send_message.assert_awaited_once()  # plain text can't reach it either
+    assert is_topic_gone(777, 42)
+    assert not is_topic_gone(777, 43)
+    assert not is_topic_gone(777, None)
+
+
+async def test_other_permanent_failure_does_not_mark_topic():
+    bot = AsyncMock()
+    bot.send_message.side_effect = BadRequest("can't parse entities")
+
+    await send_with_fallback(bot, 777, "*x", message_thread_id=42)
+
+    assert bot.send_message.await_count == 2
+    assert not is_topic_gone(777, 42)

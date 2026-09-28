@@ -278,9 +278,7 @@ def extract_bash_output(pane_text: str, command: str) -> str | None:
     match_prefix = command[:10]
     for i in range(len(lines) - 1, -1, -1):
         stripped = lines[i].strip()
-        if stripped.startswith(f"! {match_prefix}") or stripped.startswith(
-            f"!{match_prefix}"
-        ):
+        if stripped.startswith((f"! {match_prefix}", f"!{match_prefix}")):
             cmd_idx = i
             break
 

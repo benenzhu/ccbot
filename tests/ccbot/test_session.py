@@ -2,6 +2,7 @@
 
 import pytest
 
+from ccbot.config import config
 from ccbot.session import SessionManager
 
 
@@ -155,3 +156,52 @@ class TestIsWindowId:
         assert mgr._is_window_id("@") is False
         assert mgr._is_window_id("") is False
         assert mgr._is_window_id("@abc") is False
+
+
+class TestPerMessageLookups:
+    """Lookups made for every new message must not parse transcripts.
+
+    A long session's JSONL is tens of MB; parsing it per message (twice) made
+    delivery fall minutes behind.
+    """
+
+    async def test_find_users_matches_stored_session_without_reading(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        async def parse(*_args):
+            raise AssertionError("transcript was parsed")
+
+        monkeypatch.setattr(SessionManager, "_get_session_direct", parse)
+        mgr.bind_thread(1, 42, "@1")
+        mgr.bind_thread(1, 43, "@2")
+        mgr.get_window_state("@1").session_id = "sid-a"
+        mgr.get_window_state("@2").session_id = "sid-b"
+
+        assert await mgr.find_users_for_session("sid-a") == [(1, "@1", 42)]
+
+    def test_session_file_for_window_in_cwd_project(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(config, "claude_projects_path", tmp_path)
+        state = mgr.get_window_state("@1")
+        state.session_id, state.cwd = "sid", "/home/u/proj"
+        transcript = tmp_path / "-home-u-proj" / "sid.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("{}\n")
+
+        assert mgr.session_file_for_window("@1") == transcript
+
+    def test_session_file_for_window_found_in_another_project(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(config, "claude_projects_path", tmp_path)
+        state = mgr.get_window_state("@1")
+        state.session_id, state.cwd = "sid", "/home/u/moved"
+        transcript = tmp_path / "-home-u-proj" / "sid.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("{}\n")
+
+        assert mgr.session_file_for_window("@1") == transcript
+
+    def test_session_file_for_window_without_session(self, mgr: SessionManager) -> None:
+        assert mgr.session_file_for_window("@9") is None

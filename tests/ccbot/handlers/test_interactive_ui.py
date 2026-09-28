@@ -4,10 +4,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccbot.handlers.interactive_ui import (
-    _build_interactive_keyboard,
-    handle_interactive_ui,
-)
 from ccbot.handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -17,6 +13,10 @@ from ccbot.handlers.callback_data import (
     CB_ASK_SPACE,
     CB_ASK_TAB,
     CB_ASK_UP,
+)
+from ccbot.handlers.interactive_ui import (
+    _build_interactive_keyboard,
+    handle_interactive_ui,
 )
 
 

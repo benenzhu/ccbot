@@ -49,38 +49,46 @@ class TestTranscribeVoice:
     @pytest.mark.asyncio
     async def test_empty_transcription_raises(self, mock_config):
         resp = _mock_response(json_data={"text": ""})
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+        with (
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+            ),
+            pytest.raises(ValueError, match="Empty transcription"),
         ):
-            with pytest.raises(ValueError, match="Empty transcription"):
-                await transcribe.transcribe_voice(b"fake-ogg-data")
+            await transcribe.transcribe_voice(b"fake-ogg-data")
 
     @pytest.mark.asyncio
     async def test_whitespace_only_raises(self, mock_config):
         resp = _mock_response(json_data={"text": "   "})
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+        with (
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+            ),
+            pytest.raises(ValueError, match="Empty transcription"),
         ):
-            with pytest.raises(ValueError, match="Empty transcription"):
-                await transcribe.transcribe_voice(b"fake-ogg-data")
+            await transcribe.transcribe_voice(b"fake-ogg-data")
 
     @pytest.mark.asyncio
     async def test_missing_text_field_raises(self, mock_config):
         resp = _mock_response(json_data={"result": "something"})
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+        with (
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+            ),
+            pytest.raises(ValueError, match="Empty transcription"),
         ):
-            with pytest.raises(ValueError, match="Empty transcription"):
-                await transcribe.transcribe_voice(b"fake-ogg-data")
+            await transcribe.transcribe_voice(b"fake-ogg-data")
 
     @pytest.mark.asyncio
     async def test_api_error_raises(self, mock_config):
         resp = _mock_response(json_data={"error": "Unauthorized"}, status_code=401)
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+        with (
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+            ),
+            pytest.raises(httpx.HTTPStatusError),
         ):
-            with pytest.raises(httpx.HTTPStatusError):
-                await transcribe.transcribe_voice(b"fake-ogg-data")
+            await transcribe.transcribe_voice(b"fake-ogg-data")
 
     @pytest.mark.asyncio
     async def test_custom_base_url(self, mock_config):

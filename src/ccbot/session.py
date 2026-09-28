@@ -25,9 +25,9 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any
 
 import aiofiles
@@ -186,7 +186,6 @@ class SessionManager:
                         "Detected old-format state (window_name keys), "
                         "will re-resolve on startup"
                     )
-                    pass
 
             except (json.JSONDecodeError, ValueError) as e:
                 logger.warning("Failed to load state: %s", e)
@@ -195,7 +194,6 @@ class SessionManager:
                 self.thread_bindings = {}
                 self.window_display_names = {}
                 self.group_chat_ids = {}
-                pass
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
@@ -595,21 +593,29 @@ class SessionManager:
         encoded_cwd = self._encode_cwd(cwd)
         return config.claude_projects_path / encoded_cwd / f"{session_id}.jsonl"
 
+    def _locate_session_file(self, session_id: str, cwd: str) -> Path | None:
+        """Path of a session's transcript: under its cwd's project, else anywhere."""
+        file_path = self._build_session_file_path(session_id, cwd)
+        if file_path and file_path.exists():
+            return file_path
+        # Fallback: glob search if direct path doesn't exist
+        matches = list(config.claude_projects_path.glob(f"*/{session_id}.jsonl"))
+        if matches:
+            logger.debug("Found session via glob: %s", matches[0])
+            return matches[0]
+        return None
+
     async def _get_session_direct(
         self, session_id: str, cwd: str
     ) -> ClaudeSession | None:
-        """Get a ClaudeSession directly from session_id and cwd (no scanning)."""
-        file_path = self._build_session_file_path(session_id, cwd)
+        """Get a ClaudeSession directly from session_id and cwd (no scanning).
 
-        # Fallback: glob search if direct path doesn't exist
-        if not file_path or not file_path.exists():
-            pattern = f"*/{session_id}.jsonl"
-            matches = list(config.claude_projects_path.glob(pattern))
-            if matches:
-                file_path = matches[0]
-                logger.debug("Found session via glob: %s", file_path)
-            else:
-                return None
+        Reads the whole transcript (title, summary, message count) — tens of
+        MB for a long session, so hot paths use session_file_for_window.
+        """
+        file_path = self._locate_session_file(session_id, cwd)
+        if file_path is None:
+            return None
 
         # Single pass: read file once, extract title/summary + count messages
         custom_title = ""
@@ -725,6 +731,17 @@ class SessionManager:
         self._save_state()
         return None
 
+    def session_file_for_window(self, window_id: str) -> Path | None:
+        """Transcript path of the window's session, without reading the file.
+
+        For per-message paths that only need the path: resolving the full
+        ClaudeSession re-parses the whole transcript every time.
+        """
+        state = self.get_window_state(window_id)
+        if not state.session_id or not state.cwd:
+            return None
+        return self._locate_session_file(state.session_id, state.cwd)
+
     # --- User window offset management ---
 
     def update_user_window_offset(
@@ -817,12 +834,13 @@ class SessionManager:
     ) -> list[tuple[int, str, int]]:
         """Find all users whose thread-bound window maps to the given session_id.
 
-        Returns list of (user_id, window_id, thread_id) tuples.
+        Returns list of (user_id, window_id, thread_id) tuples. Runs for every
+        new message, so it compares the stored session id only — resolving
+        each window's ClaudeSession would parse every bound transcript.
         """
         result: list[tuple[int, str, int]] = []
         for user_id, thread_id, window_id in self.iter_thread_bindings():
-            resolved = await self.resolve_session_for_window(window_id)
-            if resolved and resolved.session_id == session_id:
+            if self.get_window_state(window_id).session_id == session_id:
                 result.append((user_id, window_id, thread_id))
         return result
 

@@ -62,7 +62,7 @@ SessionMonitor reads new message (session_id = "uuid-xxx")
 
 **Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: `--resume` makes the hook report a new session_id but messages continue writing to the original JSONL file; the bot overrides window_state to track the original session_id.
 
-**Topic lifecycle**: Closing/deleting a topic auto-kills the associated tmux window and unbinds the thread. Stale bindings (window deleted externally) are cleaned up by the status polling loop.
+**Topic lifecycle**: Closing/deleting a topic auto-kills the associated tmux window and unbinds the thread. Closing arrives as an update; deletion does not, so it is detected when a send to the topic fails with "message thread not found" (`is_topic_gone`) and cleaned up on the next status poll — there is no periodic probe. Stale bindings (window deleted externally) are cleaned up by the status polling loop.
 
 ## Session Lifecycle
 

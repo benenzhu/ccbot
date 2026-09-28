@@ -50,7 +50,6 @@ from telegram import (
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import (
-    AIORateLimiter,
     Application,
     CallbackQueryHandler,
     CommandHandler,
@@ -77,17 +76,18 @@ from .handlers.callback_data import (
     CB_DIR_UP,
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
+    CB_KEYS_PREFIX,
+    CB_SCREENSHOT_REFRESH,
     CB_SESSION_CANCEL,
     CB_SESSION_FORK,
     CB_SESSION_NEW,
     CB_SESSION_REPLAY,
     CB_SESSION_SELECT,
-    CB_KEYS_PREFIX,
-    CB_SCREENSHOT_REFRESH,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
     CB_WIN_NEW,
 )
+from .handlers.cleanup import clear_topic_state
 from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
@@ -108,9 +108,7 @@ from .handlers.directory_browser import (
     clear_session_picker_state,
     clear_window_picker_state,
 )
-from .handlers.cleanup import clear_topic_state
 from .handlers.history import send_history
-from .handlers.side_question import run_side_question
 from .handlers.interactive_ui import (
     INTERACTIVE_TOOL_NAMES,
     clear_interactive_mode,
@@ -136,15 +134,17 @@ from .handlers.message_sender import (
     safe_send,
     send_with_fallback,
 )
+from .handlers.response_builder import build_response_parts
+from .handlers.side_question import run_side_question
+from .handlers.status_polling import status_poll_loop
 from .markdown_v2 import (
     ParsedTable,
     convert_markdown,
     extract_markdown_tables,
     split_text_by_tables,
 )
-from .handlers.response_builder import build_response_parts
-from .handlers.status_polling import status_poll_loop
 from .monitor_state import TrackedSession
+from .request_log import LoggingRateLimiter
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
@@ -1314,7 +1314,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
-    if data.startswith(CB_HISTORY_PREV) or data.startswith(CB_HISTORY_NEXT):
+    if data.startswith((CB_HISTORY_PREV, CB_HISTORY_NEXT)):
         prefix_len = len(CB_HISTORY_PREV)  # same length for both
         rest = data[prefix_len:]
         try:
@@ -1987,6 +1987,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     # Assistant prose is read aloud; thinking and tool traffic are not.
     # The voice task is enqueued right after the text so the same per-user
     # FIFO queue delivers the bubble immediately below its message.
+    # The bot's delay on each send is logged from here (request log lag);
+    # replayed history isn't timed
+    read_at = None if msg.is_replay else msg.read_at
     speak = (
         config.tts_enabled
         and not msg.is_replay
@@ -2009,10 +2012,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
             if handled:
                 # Update user's read offset
-                session = await session_manager.resolve_session_for_window(wid)
-                if session and session.file_path:
+                session_file = session_manager.session_file_for_window(wid)
+                if session_file:
                     try:
-                        file_size = Path(session.file_path).stat().st_size
+                        file_size = session_file.stat().st_size
                         session_manager.update_user_window_offset(
                             user_id, wid, file_size
                         )
@@ -2057,7 +2060,13 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             for seg in segments:
                 if isinstance(seg, tuple):
                     await enqueue_table_message(
-                        bot, user_id, wid, seg, thread_id, ticket=msg.ticket
+                        bot,
+                        user_id,
+                        wid,
+                        seg,
+                        thread_id,
+                        ticket=msg.ticket,
+                        read_at=read_at,
                     )
                     continue
                 await enqueue_content_message(
@@ -2072,6 +2081,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                     text=seg,
                     thread_id=thread_id,
                     ticket=msg.ticket,
+                    read_at=read_at,
                 )
         elif msg.is_complete:
             parts = build_response_parts(
@@ -2092,18 +2102,21 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
                 image_data=list(msg.image_data) if msg.image_data else None,
                 tables=tables or None,
                 ticket=msg.ticket,
+                read_at=read_at,
             )
 
         if msg.is_complete:
             if speak:
-                await enqueue_voice_message(bot, user_id, wid, msg.text, thread_id)
+                await enqueue_voice_message(
+                    bot, user_id, wid, msg.text, thread_id, read_at=read_at
+                )
 
             # Update user's read offset to current file position
             # This marks these messages as "read" for this user
-            session = await session_manager.resolve_session_for_window(wid)
-            if session and session.file_path:
+            session_file = session_manager.session_file_for_window(wid)
+            if session_file:
                 try:
-                    file_size = Path(session.file_path).stat().st_size
+                    file_size = session_file.stat().st_size
                     session_manager.update_user_window_offset(user_id, wid, file_size)
                 except OSError:
                     pass
@@ -2193,8 +2206,9 @@ def create_bot() -> Application:
         # One request every 2.2s across the whole bot. Telegram only
         # tolerates ~1 msg/s per chat and every topic here lives in one
         # private chat, which AIORateLimiter otherwise leaves unlimited.
+        # LoggingRateLimiter logs each request (see request_log.py).
         .rate_limiter(
-            AIORateLimiter(
+            LoggingRateLimiter(
                 overall_max_rate=1, overall_time_period=2.2, max_retries=5
             )
         )

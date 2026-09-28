@@ -9,7 +9,8 @@ Runs an async polling loop that:
 Delivery is at-least-once: every NewMessage carries a DeliveryTicket that pins
 the persisted offset at its JSONL line until the message has been sent.
 History replays are compacted (config.replay_compact): thinking and tool
-messages are dropped, each run of them replaced by one divider line.
+messages are dropped, each run of them marked by a divider line at the top of
+the next message kept.
 
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
@@ -19,9 +20,11 @@ Key classes: SessionMonitor, NewMessage, SessionInfo.
 import asyncio
 import json
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any
 
 import aiofiles
 
@@ -33,7 +36,7 @@ from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
 
-# Compact replay: content types dropped, and the line that stands in for them
+# Compact replay: content types dropped, and the line that marks where they were
 REPLAY_DROPPED_TYPES = frozenset({"thinking", "tool_use", "tool_result"})
 REPLAY_DIVIDER = "┄┄┄┄┄┄┄┄┄┄"
 
@@ -59,6 +62,7 @@ class NewMessage:
     tool_name: str | None = None  # For tool_use messages, the tool name
     image_data: list[tuple[str, bytes]] | None = None  # From tool_result images
     is_replay: bool = False  # True when replaying past history (e.g. --resume)
+    read_at: float | None = None  # epoch seconds the monitor read the JSONL entry
     # Pins the persisted offset until this message is delivered. Whoever
     # queues the message takes a hold(); the monitor releases its own
     # reference once the callback returns.
@@ -100,7 +104,8 @@ class SessionMonitor:
         self._file_mtimes: dict[str, float] = {}  # session_id -> last_seen_mtime
         # Replaying sessions currently inside a run of dropped blocks (the
         # divider for that run has already been emitted).
-        self._replay_gap_open: set[str] = set()
+        # session_id -> line offset where a dropped replay run began
+        self._replay_gap_open: dict[str, int] = {}
         # Forks copy messages with their original UUIDs but rewrite the JSONL,
         # so a source byte offset cannot be used to skip inherited history.
         self._fork_history_uuids: dict[str, set[str]] = {}
@@ -399,6 +404,7 @@ class SessionMonitor:
                 new_lines = await self._read_new_lines_with_offsets(
                     tracked, session_info.file_path
                 )
+                read_at = time.time()
                 self._file_mtimes[session_info.session_id] = current_mtime
 
                 inherited = self._fork_history_uuids.get(session_info.session_id)
@@ -451,21 +457,27 @@ class SessionMonitor:
                     # Also true for history re-read after a restart
                     is_replay = was_replaying or tracked.is_replay(line_offset)
 
-                    text = entry.text
-                    content_type = entry.content_type
-                    dropped = (
+                    if (
                         is_replay
                         and config.replay_compact
-                        and content_type in REPLAY_DROPPED_TYPES
+                        and entry.content_type in REPLAY_DROPPED_TYPES
+                    ):
+                        # The run gets a divider on the next message kept
+                        self._replay_gap_open.setdefault(
+                            session_info.session_id, line_offset
+                        )
+                        continue
+
+                    text = entry.text
+                    ticket_offset = line_offset
+                    gap_offset = self._replay_gap_open.pop(
+                        session_info.session_id, None
                     )
-                    if dropped:
-                        # One divider stands in for the whole run
-                        if session_info.session_id in self._replay_gap_open:
-                            continue
-                        self._replay_gap_open.add(session_info.session_id)
-                        text, content_type = REPLAY_DIVIDER, "text"
-                    else:
-                        self._replay_gap_open.discard(session_info.session_id)
+                    if gap_offset is not None and is_replay:
+                        text = f"{REPLAY_DIVIDER}\n{text}"
+                        # Re-read from the run's start, so a restart before
+                        # delivery brings the divider back too
+                        ticket_offset = gap_offset
 
                     # The ticket pins the saved offset at this message's line
                     # until it is delivered (opened before the save below).
@@ -474,13 +486,14 @@ class SessionMonitor:
                             session_id=session_info.session_id,
                             text=text,
                             is_complete=True,
-                            content_type=content_type,
-                            tool_use_id=None if dropped else entry.tool_use_id,
-                            role="assistant" if dropped else entry.role,
-                            tool_name=None if dropped else entry.tool_name,
-                            image_data=None if dropped else entry.image_data,
+                            content_type=entry.content_type,
+                            tool_use_id=entry.tool_use_id,
+                            role=entry.role,
+                            tool_name=entry.tool_name,
+                            image_data=entry.image_data,
                             is_replay=is_replay,
-                            ticket=self.state.open_ticket(tracked, line_offset),
+                            read_at=read_at,
+                            ticket=self.state.open_ticket(tracked, ticket_offset),
                         )
                     )
 
@@ -490,7 +503,8 @@ class SessionMonitor:
                     tracked.replaying = False
                     tracked.replay_until = tracked.last_byte_offset
                     self.state.update_session(tracked)
-                    self._replay_gap_open.discard(session_info.session_id)
+                    # A run at the very end of the history has nothing to mark
+                    self._replay_gap_open.pop(session_info.session_id, None)
 
                 if tracked.last_byte_offset != previous_offset:
                     self.state.update_session(tracked)
@@ -535,7 +549,7 @@ class SessionMonitor:
         active_session_ids = set(current_map.values())
 
         stale_sessions = []
-        for session_id in self.state.tracked_sessions.keys():
+        for session_id in self.state.tracked_sessions:
             if session_id not in active_session_ids:
                 stale_sessions.append(session_id)
 

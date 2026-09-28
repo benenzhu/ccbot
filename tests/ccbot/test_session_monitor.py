@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -363,7 +364,7 @@ class TestAtLeastOnceDelivery:
 
 
 class TestCompactReplay:
-    """History replay drops thinking/tool messages, one divider per run."""
+    """History replay drops thinking/tool messages; a divider marks each run."""
 
     @pytest.fixture
     def monitor(self, tmp_path):
@@ -421,7 +422,7 @@ class TestCompactReplay:
         )
         return await monitor.check_for_updates({"s"})
 
-    async def test_runs_of_tool_and_thinking_collapse_to_one_divider(
+    async def test_each_dropped_run_is_a_divider_atop_the_next_message(
         self, monitor, tmp_path, make_jsonl_entry, monkeypatch
     ):
         from ccbot.session_monitor import REPLAY_DIVIDER
@@ -429,16 +430,45 @@ class TestCompactReplay:
         monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", True)
         messages = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
 
+        # No message of its own: the divider costs no extra send
         assert [m.text for m in messages] == [
             "fix the bug",
-            REPLAY_DIVIDER,
-            "fixed it",
-            REPLAY_DIVIDER,
-            "all done",
+            f"{REPLAY_DIVIDER}\nfixed it",
+            f"{REPLAY_DIVIDER}\nall done",
         ]
         assert all(m.content_type == "text" for m in messages)
         assert all(m.is_replay for m in messages)
         assert all(m.tool_use_id is None for m in messages)
+        # Each carries when the monitor read it (the request log's lag start)
+        assert all(abs(m.read_at - time.time()) < 5 for m in messages)
+
+    async def test_restart_before_delivery_keeps_the_divider(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        """The divided message is re-read from its run's start, divider included."""
+        from ccbot.session_monitor import REPLAY_DIVIDER
+
+        monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", True)
+        first_run = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
+        assert first_run[0].ticket is not None
+        first_run[0].ticket.release()  # only "fix the bug" got delivered
+        monitor.state.save()
+
+        restarted = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+        monkeypatch.setattr(
+            restarted,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", tmp_path / "session.jsonl")]),
+        )
+        messages = await restarted.check_for_updates({"s"})
+
+        assert [m.text for m in messages] == [
+            f"{REPLAY_DIVIDER}\nfixed it",
+            f"{REPLAY_DIVIDER}\nall done",
+        ]
 
     async def test_full_replay_when_disabled(
         self, monitor, tmp_path, make_jsonl_entry, monkeypatch

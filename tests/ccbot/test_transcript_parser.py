@@ -344,7 +344,7 @@ class TestParseEntries:
 
     def test_assistant_text(self, make_jsonl_entry, make_text_block):
         entries = [make_jsonl_entry("assistant", [make_text_block("Hello!")])]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         assert len(result) == 1
         assert result[0].role == "assistant"
         assert result[0].text == "Hello!"
@@ -352,7 +352,7 @@ class TestParseEntries:
 
     def test_user_text(self, make_jsonl_entry, make_text_block):
         entries = [make_jsonl_entry("user", [make_text_block("Hi bot")])]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         assert len(result) == 1
         assert result[0].role == "user"
         assert result[0].text == "Hi bot"
@@ -388,7 +388,7 @@ class TestParseEntries:
         entries = [
             make_jsonl_entry("assistant", [make_thinking_block("reasoning here")])
         ]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         assert len(result) == 1
         assert result[0].content_type == "thinking"
         assert EXPQUOTE_START in result[0].text
@@ -401,7 +401,7 @@ class TestParseEntries:
             "<local-command-stdout>all good</local-command-stdout>"
         )
         entries = [make_jsonl_entry("user", [make_text_block(xml)])]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         assert len(result) == 1
         assert result[0].content_type == "local_command"
         assert "/status" in result[0].text
@@ -412,7 +412,7 @@ class TestParseEntries:
             "t1", "ExitPlanMode", {"plan": "Step 1: do X\nStep 2: do Y"}
         )
         entries = [make_jsonl_entry("assistant", [block])]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         texts = [e for e in result if e.content_type == "text"]
         tool_uses = [e for e in result if e.content_type == "tool_use"]
         assert len(texts) == 1
@@ -440,7 +440,7 @@ class TestParseEntries:
                 [make_tool_result_block("t1", "OK")],
             ),
         ]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         tool_result_entries = [e for e in result if e.content_type == "tool_result"]
         assert len(tool_result_entries) == 1
         tr = tool_result_entries[0]
@@ -464,7 +464,7 @@ class TestParseEntries:
                 [make_tool_result_block("t1", "Permission denied", is_error=True)],
             ),
         ]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         tool_result_entries = [e for e in result if e.content_type == "tool_result"]
         assert len(tool_result_entries) == 1
         assert "Error: Permission denied" in tool_result_entries[0].text
@@ -485,7 +485,7 @@ class TestParseEntries:
                 [make_tool_result_block("t1", TranscriptParser._INTERRUPTED_TEXT)],
             ),
         ]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         tool_result_entries = [e for e in result if e.content_type == "tool_result"]
         assert len(tool_result_entries) == 1
         assert "Interrupted" in tool_result_entries[0].text
@@ -513,7 +513,7 @@ class TestParseEntries:
                 [make_tool_use_block("t1", "Read", {"file_path": "a.py"})],
             ),
         ]
-        result, pending = TranscriptParser.parse_entries(entries, pending_tools=None)
+        result, _pending = TranscriptParser.parse_entries(entries, pending_tools=None)
         tool_entries = [e for e in result if e.tool_use_id == "t1"]
         assert len(tool_entries) == 2
         assert tool_entries[0].content_type == "tool_use"
@@ -530,6 +530,6 @@ class TestParseEntries:
                 ],
             ),
         ]
-        result, pending = TranscriptParser.parse_entries(entries)
+        result, _pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0

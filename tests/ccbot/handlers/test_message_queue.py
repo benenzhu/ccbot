@@ -1,12 +1,13 @@
 """Unit tests for message_queue — voice, tables, merging, and retry-until-delivered."""
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiolimiter import AsyncLimiter
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
-from ccbot.handlers import message_queue
+from ccbot.handlers import message_queue, message_sender
 from ccbot.handlers.message_queue import MessageTask, _process_voice_task
 from ccbot.monitor_state import DeliveryTicket
 from ccbot.tts import TtsApiError
@@ -279,7 +280,7 @@ async def test_merge_carries_tables_and_images_from_all_tasks():
     )
 
     assert count == 1
-    assert merged.parts == ["a", "b"]
+    assert merged.parts == ["a\n\nb"]  # one message, one request
     assert merged.image_data == [("img", b"1"), ("img", b"2")]
     assert merged.tables == [(["h"], [["v"]])]
 
@@ -665,3 +666,278 @@ async def test_status_update_is_skipped_while_chat_has_no_free_slot():
         message_queue._chat_next_send.clear()
         await message_queue._process_status_update_task(bot, 5, task)
         send.assert_awaited_once()
+
+
+# --- Backlog: a tool_use whose result is already queued goes out as the result ---
+
+
+@pytest.fixture
+def _clean_status_state():
+    """Start and end with no status message, tool message or gone topic tracked."""
+    for state in (
+        message_queue._status_msg_info,
+        message_queue._status_shown_at,
+        message_queue._tool_msg_ids,
+        message_sender._gone_topics,
+    ):
+        state.clear()
+    yield
+    for state in (
+        message_queue._status_msg_info,
+        message_queue._status_shown_at,
+        message_queue._tool_msg_ids,
+        message_sender._gone_topics,
+    ):
+        state.clear()
+
+
+def _tool_task(kind: str, tool_id: str, thread_id: int | None = 42) -> MessageTask:
+    return MessageTask(
+        task_type="content",
+        window_id="@1",
+        thread_id=thread_id,
+        parts=[f"{kind} {tool_id}"],
+        tool_use_id=tool_id,
+        content_type=kind,
+    )
+
+
+async def test_queued_tool_result_is_sent_in_place_of_its_tool_use():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    use_ticket, _ = _ticket()
+    result_ticket, _ = _ticket()
+    tool_use = _tool_task("tool_use", "A")
+    tool_use.tickets = [use_ticket]
+    other_use = _tool_task("tool_use", "B")
+    result = _tool_task("tool_result", "A")
+    result.tickets = [result_ticket]
+    other_result = _tool_task("tool_result", "B")
+    for item in (other_use, result, other_result):
+        queue.put_nowait(item)
+
+    sent, absorbed = await message_queue._absorb_queued_tool_result(
+        queue, tool_use, asyncio.Lock()
+    )
+
+    assert absorbed == 1
+    assert sent is result
+    assert sent.tickets == [use_ticket, result_ticket]
+    # Everything else keeps its order
+    assert queue.get_nowait() is other_use
+    assert queue.get_nowait() is other_result
+    assert queue.empty()
+
+
+async def test_tool_use_is_sent_as_is_without_its_result_queued():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    tool_use = _tool_task("tool_use", "A")
+    other_thread = _tool_task("tool_result", "A", thread_id=43)
+    other_tool = _tool_task("tool_result", "B")
+    queue.put_nowait(other_thread)
+    queue.put_nowait(other_tool)
+
+    sent, absorbed = await message_queue._absorb_queued_tool_result(
+        queue, tool_use, asyncio.Lock()
+    )
+
+    assert (sent, absorbed) == (tool_use, 0)
+    assert queue.get_nowait() is other_thread
+    assert queue.get_nowait() is other_tool
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_worker_sends_backlogged_tool_call_once_instead_of_send_plus_edit():
+    bot = AsyncMock()
+    send = AsyncMock(return_value=AsyncMock(message_id=1))
+    resolve, fallback, status, sleep = _content_patches(send)
+    with resolve, fallback, status, sleep:
+        queue = message_queue.get_or_create_queue(bot, 4444)
+        try:
+            queue.put_nowait(_tool_task("tool_use", "A"))
+            queue.put_nowait(_tool_task("tool_result", "A"))
+            await asyncio.wait_for(queue.join(), 1)  # both tasks accounted for
+        finally:
+            message_queue._queue_workers.pop(4444).cancel()
+            message_queue._message_queues.pop(4444, None)
+            message_queue._queue_locks.pop(4444, None)
+
+    assert [call.args[2] for call in send.await_args_list] == ["tool_result A"]
+    bot.edit_message_text.assert_not_awaited()
+    assert ("A", 4444, 42) not in message_queue._tool_msg_ids
+
+
+# --- Status is optional traffic: it yields to everything else ---
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+def test_status_counters_only_change_is_refreshed_at_most_every_interval():
+    skey = (5, 42)
+    with patch.object(message_queue.time, "monotonic", return_value=1000.0) as now:
+        message_queue._remember_status(skey, 9, "@1", "Roosting… (12s · ↓ 1.2k)")
+
+        now.return_value = 1005.0
+        assert message_queue._status_is_current(skey, "@1", "Roosting… (17s · ↓ 1.5k)")
+        assert not message_queue._status_is_current(
+            skey, "@1", "Pondering… (17s · ↓ 1.5k)"
+        )  # a real change shows right away
+        assert not message_queue._status_is_current(
+            skey, "@2", "Roosting… (12s · ↓ 1.2k)"
+        )
+
+        now.return_value = 1000.0 + message_queue.STATUS_COUNTER_REFRESH
+        assert not message_queue._status_is_current(
+            skey, "@1", "Roosting… (42s · ↓ 3.0k)"
+        )
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_status_waits_until_the_global_limiter_is_idle():
+    task = MessageTask(
+        task_type="status_update", window_id="@1", text="Working…", thread_id=42
+    )
+    busy = AsyncLimiter(1, 2.2)
+    await busy.acquire()  # a request just went out
+    bot = AsyncMock()
+    bot.rate_limiter = MagicMock(_base_limiter=busy)
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "_do_send_status_message", AsyncMock()) as send,
+    ):
+        await message_queue._process_status_update_task(bot, 5, task)
+        send.assert_not_awaited()
+
+        bot.rate_limiter = MagicMock(_base_limiter=AsyncLimiter(1, 2.2))
+        await message_queue._process_status_update_task(bot, 5, task)
+        send.assert_awaited_once()
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_status_edit_sends_no_typing_action():
+    bot = AsyncMock()
+    message_queue._remember_status((5, 42), 9, "@1", "Reading a.py")
+    task = MessageTask(
+        task_type="status_update", window_id="@1", text="Writing b.py", thread_id=42
+    )
+    with patch.object(
+        message_queue.session_manager, "resolve_chat_id", return_value=777
+    ):
+        await message_queue._process_status_update_task(bot, 5, task)
+
+    bot.edit_message_text.assert_awaited_once()
+    bot.send_chat_action.assert_not_awaited()
+    assert message_queue._status_msg_info[(5, 42)] == (9, "@1", "Writing b.py")
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_tool_result_edit_leaves_the_status_message_in_place():
+    bot = AsyncMock()
+    message_queue._remember_status((5, 0), 55, "@1", "Working…")
+    message_queue._tool_msg_ids[("tool-1", 5, 0)] = 1234
+    task = _tool_task("tool_result", "tool-1", thread_id=None)
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "_pace", AsyncMock()),
+        patch.object(message_queue.tmux_manager, "find_window_by_id", AsyncMock()),
+    ):
+        await message_queue._process_content_task(bot, 5, task)
+
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 1234
+    bot.delete_message.assert_not_awaited()  # status is still the last message
+    assert message_queue._status_msg_info[(5, 0)][0] == 55
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_attachments_after_tool_result_edit_do_not_land_below_status():
+    bot = AsyncMock()
+    message_queue._remember_status((5, 0), 55, "@1", "Working…")
+    message_queue._tool_msg_ids[("tool-1", 5, 0)] = 1234
+    task = _tool_task("tool_result", "tool-1", thread_id=None)
+    task.image_data = [("image/png", b"png")]
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "_pace", AsyncMock()),
+        patch.object(message_queue, "send_photo", AsyncMock()) as photo,
+        patch.object(message_queue, "_check_and_send_status", AsyncMock()),
+    ):
+        await message_queue._process_content_task(bot, 5, task)
+
+    bot.delete_message.assert_awaited_once_with(chat_id=777, message_id=55)
+    photo.assert_awaited_once()
+
+
+# --- Deleted topics: queued tasks for them are dropped, not sent ---
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_worker_drops_tasks_for_a_deleted_topic():
+    bot = AsyncMock()
+    held, delivered = _ticket()
+    message_sender._gone_topics.add((777, 42))
+    send = AsyncMock()
+    resolve, fallback, status, sleep = _content_patches(send)
+    with resolve, fallback, status, sleep:
+        queue = message_queue.get_or_create_queue(bot, 4545)
+        try:
+            queue.put_nowait(
+                MessageTask(
+                    task_type="content",
+                    window_id="@1",
+                    thread_id=42,
+                    parts=["x"],
+                    tickets=[held],
+                )
+            )
+            await asyncio.wait_for(queue.join(), 1)
+        finally:
+            message_queue._queue_workers.pop(4545).cancel()
+            message_queue._message_queues.pop(4545, None)
+            message_queue._queue_locks.pop(4545, None)
+
+    send.assert_not_awaited()
+    assert delivered == ["delivered"]  # the monitor offset moves on
+
+
+# --- Lag: a combined message is as late as its earliest-read part ---
+
+
+async def test_merged_and_absorbed_tasks_keep_the_earliest_read_time():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    first = MessageTask(task_type="content", window_id="@1", parts=["a"])
+    queue.put_nowait(
+        MessageTask(task_type="content", window_id="@1", parts=["b"], read_at=100.0)
+    )
+    merged, _ = await message_queue._merge_content_tasks(queue, first, asyncio.Lock())
+    assert merged.read_at == 100.0  # unknown time doesn't win
+
+    tool_use = _tool_task("tool_use", "A")
+    tool_use.read_at = 200.0
+    result = _tool_task("tool_result", "A")
+    result.read_at = 205.0
+    queue.put_nowait(result)
+    sent, _ = await message_queue._absorb_queued_tool_result(
+        queue, tool_use, asyncio.Lock()
+    )
+    assert sent.read_at == 200.0
+
+
+# --- Merged tasks share messages: every part costs a request ---
+
+
+def test_merged_parts_join_into_one_message_while_they_fit():
+    parts = ["∴ Thinking…\n(thinking)"]
+    message_queue._append_parts(parts, ["∴ Thinking…\nsecond", "tail"])
+    assert parts == ["∴ Thinking…\n(thinking)\n\n∴ Thinking…\nsecond\n\ntail"]
+
+
+def test_merged_parts_stay_apart_when_escaping_would_overflow():
+    # 3000 raw chars of MarkdownV2-escaped punctuation convert to > 4096
+    heavy = "a.b-c(d)" * 375
+    parts = ["short"]
+    message_queue._append_parts(parts, [heavy])
+    assert parts == ["short", heavy]

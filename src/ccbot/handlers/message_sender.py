@@ -12,6 +12,7 @@ Functions:
   - safe_reply: Reply with formatting, fallback to plain text
   - safe_edit: Edit message with formatting, fallback to plain text
   - safe_send: Send message with formatting, fallback to plain text
+  - is_topic_gone: Topics a send found deleted (Telegram sends no update)
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
 Transient failures (RetryAfter, timeouts, network errors — see
@@ -65,6 +66,33 @@ def is_transient_error(error: BaseException) -> bool:
     return isinstance(error, NetworkError)  # includes TimedOut
 
 
+# Telegram sends no update when a topic is deleted; the first message sent to
+# it fails with one of these instead. Topics seen failing this way are kept
+# here (chat_id, thread_id) until the status poller cleans up their binding.
+_TOPIC_GONE_MARKERS = ("message thread not found", "topic_id_invalid", "topic_deleted")
+_gone_topics: set[tuple[int, int]] = set()
+
+
+def is_topic_gone_error(error: BaseException) -> bool:
+    """True when a send failed because its forum topic no longer exists."""
+    text = str(error).lower()
+    return isinstance(error, BadRequest) and any(
+        marker in text for marker in _TOPIC_GONE_MARKERS
+    )
+
+
+def is_topic_gone(chat_id: int, thread_id: int | None) -> bool:
+    """True once a send to this topic has failed with a topic-gone error."""
+    return thread_id is not None and (chat_id, thread_id) in _gone_topics
+
+
+def _mark_topic_gone(chat_id: int, thread_id: int | None, error: Exception) -> None:
+    if thread_id is None or (chat_id, thread_id) in _gone_topics:
+        return
+    _gone_topics.add((chat_id, thread_id))
+    logger.warning("Topic %d in chat %d is gone: %s", thread_id, chat_id, error)
+
+
 # Disable link previews in all messages to reduce visual noise
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -101,6 +129,10 @@ async def send_with_fallback(
     except Exception as e:
         if must_raise(e):
             raise
+        if is_topic_gone_error(e):
+            # Plain text can't reach a deleted topic either
+            _mark_topic_gone(chat_id, kwargs.get("message_thread_id"), e)
+            return None
         try:
             return await bot.send_message(
                 chat_id=chat_id, text=strip_sentinels(text), **kwargs
@@ -108,6 +140,9 @@ async def send_with_fallback(
         except Exception as e:
             if must_raise(e):
                 raise
+            if is_topic_gone_error(e):
+                _mark_topic_gone(chat_id, kwargs.get("message_thread_id"), e)
+                return None
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
 

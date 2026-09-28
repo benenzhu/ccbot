@@ -244,6 +244,7 @@ def hook_main() -> None:
         ],
         capture_output=True,
         text=True,
+        check=False,  # a failure shows up as empty output, handled below
     )
     raw_output = result.stdout.strip()
     # Expected format: "session_name:@id:window_name"

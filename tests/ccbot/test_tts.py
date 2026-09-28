@@ -276,20 +276,24 @@ class TestSynthesizeSpeech:
     @pytest.mark.asyncio
     async def test_empty_audio_raises(self, mock_config):
         resp = _mock_response(content=b"")
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+        with (
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+            ),
+            pytest.raises(tts.TtsApiError, match="Empty audio"),
         ):
-            with pytest.raises(tts.TtsApiError, match="Empty audio"):
-                await tts.synthesize_speech("你好")
+            await tts.synthesize_speech("你好")
 
     @pytest.mark.asyncio
     async def test_api_error_raises(self, mock_config):
         resp = _mock_response(text="unauthorized", status_code=401)
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+        with (
+            patch.object(
+                httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp
+            ),
+            pytest.raises(httpx.HTTPStatusError),
         ):
-            with pytest.raises(httpx.HTTPStatusError):
-                await tts.synthesize_speech("你好")
+            await tts.synthesize_speech("你好")
 
 
 class TestCloseClient:

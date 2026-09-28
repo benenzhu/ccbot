@@ -135,11 +135,10 @@ class TranscriptParser:
         for item in content_list:
             if isinstance(item, str):
                 texts.append(item)
-            elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    text = item.get("text", "")
-                    if text:
-                        texts.append(text)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                if text:
+                    texts.append(text)
 
         return "\n".join(texts)
 
@@ -162,7 +161,7 @@ class TranscriptParser:
         # Skip the --- / +++ header lines
         result_lines: list[str] = []
         for line in diff:
-            if line.startswith("---") or line.startswith("+++"):
+            if line.startswith(("---", "+++")):
                 continue
             # Strip trailing newline for clean display
             result_lines.append(line.rstrip("\n"))
@@ -497,7 +496,6 @@ class TranscriptParser:
 
             if msg_type == "assistant":
                 # Process content blocks
-                has_text = False
                 for block in content:
                     if not isinstance(block, dict):
                         continue
@@ -514,7 +512,6 @@ class TranscriptParser:
                                     timestamp=entry_timestamp,
                                 )
                             )
-                            has_text = True
 
                     elif btype == "tool_use":
                         tool_id = block.get("id", "")
@@ -569,6 +566,8 @@ class TranscriptParser:
                             )
 
                     elif btype == "thinking":
+                        # Thinking stored without its text says nothing
+                        # worth a message, so only real thinking is shown
                         thinking_text = block.get("thinking", "")
                         if thinking_text:
                             quoted = cls._format_expandable_quote(thinking_text)
@@ -576,15 +575,6 @@ class TranscriptParser:
                                 ParsedEntry(
                                     role="assistant",
                                     text=quoted,
-                                    content_type="thinking",
-                                    timestamp=entry_timestamp,
-                                )
-                            )
-                        elif not has_text:
-                            result.append(
-                                ParsedEntry(
-                                    role="assistant",
-                                    text="(thinking)",
                                     content_type="thinking",
                                     timestamp=entry_timestamp,
                                 )

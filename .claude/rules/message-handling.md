@@ -8,9 +8,10 @@ Per-user message queues + worker pattern for all send tasks:
 - Multi-user concurrent processing without interference
 
 **Message merging**: The worker automatically merges consecutive mergeable content messages on dequeue:
-- Content messages for the same window can be merged (including text, thinking)
+- Content messages for the same window can be merged (including text, thinking); merged parts are joined into one Telegram message while the converted MarkdownV2 fits 4096 chars (each part is its own send, so joining is what saves requests)
 - tool_use breaks the merge chain and is sent separately (message ID recorded for later editing)
 - tool_result breaks the merge chain and is edited into the tool_use message (preventing order confusion)
+- Backlog: when a tool_use's tool_result is already queued, the tool_use is not sent — the result goes out once in its place (same final message, one request instead of send + edit)
 - Merging stops when combined length exceeds 3800 characters (to avoid pagination)
 
 ## Status Message Handling
@@ -21,7 +22,9 @@ Per-user message queues + worker pattern for all send tasks:
 
 **Polling**: Background task polls terminal status for all active windows at 5-second intervals, so status edits use only a small share of the send quota.
 
-**Deduplication**: The worker compares `last_text` when processing status updates; identical content skips the edit, reducing API calls.
+**Status yields to content**: a status send/edit goes out only when the bot-wide limiter is idle (`_status_slot_free`), so it never makes Claude's output wait. No "typing" chat action is sent. A tool_result edit leaves the status message in place (it is still the last message); tables/images sent after such an edit clear it first.
+
+**Deduplication**: Identical status text skips the edit. A status line whose only change is its counters (elapsed time, tokens) is refreshed at most every 30s (`STATUS_COUNTER_REFRESH`); any other change shows on the next poll.
 
 ## Rate Limiting
 

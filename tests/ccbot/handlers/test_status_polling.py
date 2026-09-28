@@ -5,10 +5,12 @@ model picker renders in the terminal, and the status poller detects it
 on its next 1s tick.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccbot.handlers import message_sender, status_polling
 from ccbot.handlers.status_polling import update_status_message
 
 
@@ -139,3 +141,37 @@ class TestStatusPollerSettingsDetection:
             assert keyboard is not None
             # Verify the message text contains model picker content
             assert "Select model" in call_kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_poll_loop_cleans_up_a_topic_a_send_found_deleted():
+    """No periodic probe: a failed send marks the topic, the next poll acts."""
+    bot = AsyncMock()
+    window = MagicMock(window_id="@1")
+    message_sender._gone_topics.add((777, 42))
+    try:
+        with (
+            patch.object(status_polling, "session_manager") as sm,
+            patch.object(status_polling, "tmux_manager") as tmux,
+            patch.object(status_polling, "clear_topic_state", AsyncMock()) as clear,
+            patch.object(status_polling, "update_status_message", AsyncMock()) as upd,
+            patch.object(
+                status_polling.asyncio,
+                "sleep",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ),
+        ):
+            sm.iter_thread_bindings.return_value = [(5, 42, "@1")]
+            sm.resolve_chat_id.return_value = 777
+            tmux.find_window_by_id = AsyncMock(return_value=window)
+            tmux.kill_window = AsyncMock()
+            with pytest.raises(asyncio.CancelledError):
+                await status_polling.status_poll_loop(bot)
+    finally:
+        message_sender._gone_topics.clear()
+
+    tmux.kill_window.assert_awaited_once_with("@1")
+    sm.unbind_thread.assert_called_once_with(5, 42)
+    clear.assert_awaited_once_with(5, 42, bot)
+    upd.assert_not_awaited()
+    bot.unpin_all_forum_topic_messages.assert_not_awaited()

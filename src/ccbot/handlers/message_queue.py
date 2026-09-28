@@ -14,8 +14,14 @@ Provides a queue-based message processing system that ensures:
 
 Rate limiting: AIORateLimiter on the Application handles the global limit and
 groups, but has no per-chat limiter for private chats. This module therefore
-paces every chat itself (_pace / _try_pace): content waits for a send slot,
-status is skipped when none is free.
+paces every chat itself (_pace / _try_pace): content waits for a send slot.
+Status is optional traffic: it goes out only when the bot-wide limiter is idle
+too (_status_slot_free), and a status line whose only change is its counters
+is refreshed at most every STATUS_COUNTER_REFRESH seconds.
+
+Saving requests under backlog: a tool_use whose tool_result is already queued
+is not sent and edited — the result goes out once, in the tool_use's place.
+Tasks for a topic that turned out deleted are dropped.
 
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
@@ -27,17 +33,20 @@ Key components:
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Literal
 
+from aiolimiter import AsyncLimiter
 from telegram import Bot
-from telegram.constants import ChatAction
+from telegram.constants import MessageLimit
 from telegram.error import RetryAfter
 
 from ..config import config
 from ..markdown_v2 import ParsedTable, convert_markdown, table_to_markdown
 from ..monitor_state import DeliveryTicket
+from ..request_log import request_purpose
 from ..screenshot import render_table_image
 from ..session import session_manager
 from ..terminal_parser import parse_status_line
@@ -46,6 +55,7 @@ from ..tts import prepare_tts_segments, synthesize_prepared
 from .message_sender import (
     NO_LINK_PREVIEW,
     PARSE_MODE,
+    is_topic_gone,
     is_transient_error,
     send_photo,
     send_rich_markdown,
@@ -84,6 +94,10 @@ class MessageTask:
     # Receipts released once the task is delivered (or permanently failed),
     # letting the monitor's persisted offset move past the source messages.
     tickets: list[DeliveryTicket] = field(default_factory=list)
+    # When the bot read the (oldest) source message from the JSONL, epoch
+    # seconds; the request log reports each send's lag behind it. None for
+    # replayed history.
+    read_at: float | None = None
     # Retry bookkeeping: the first part has been handled (status conversion
     # must not run again), voice segments already sent, and how often the
     # attachments/voice failed transiently.
@@ -156,6 +170,56 @@ def _try_pace(chat_id: int) -> bool:
     return _reserve_send_slot(chat_id, wait=False) is not None
 
 
+# A status line whose only change is its counters (elapsed time, tokens) is
+# refreshed at most this often; any other change shows on the next poll.
+STATUS_COUNTER_REFRESH = 30.0
+
+# (user_id, thread_id_or_0) -> monotonic time the status message was last set
+_status_shown_at: dict[tuple[int, int], float] = {}
+
+_RE_STATUS_NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _global_send_slot_free(bot: Bot) -> bool:
+    """True when the bot-wide rate limiter would let a request through now."""
+    rate_limiter = getattr(bot, "rate_limiter", None)
+    limiter = getattr(rate_limiter, "_base_limiter", None)
+    return not isinstance(limiter, AsyncLimiter) or limiter.has_capacity()
+
+
+def _status_slot_free(bot: Bot, chat_id: int) -> bool:
+    """Take a send slot for status only if no other request would wait for it.
+
+    Every request shares one bot-wide slot per 2.2s, so a status edit queued
+    there delays Claude's actual output. Status goes out only when the global
+    limiter is idle and the chat has a slot free.
+    """
+    return _global_send_slot_free(bot) and _try_pace(chat_id)
+
+
+def _status_is_current(skey: tuple[int, int], window_id: str, text: str) -> bool:
+    """True when the status message on display needs no update for text."""
+    info = _status_msg_info.get(skey)
+    if not info or info[1] != window_id:
+        return False
+    shown = info[2]
+    if shown == text:
+        return True
+    if _RE_STATUS_NUMBER.sub("#", shown) != _RE_STATUS_NUMBER.sub("#", text):
+        return False
+    # Only the counters moved: keep what is shown until it gets stale
+    age = time.monotonic() - _status_shown_at.get(skey, 0.0)
+    return age < STATUS_COUNTER_REFRESH
+
+
+def _remember_status(
+    skey: tuple[int, int], msg_id: int, window_id: str, text: str
+) -> None:
+    """Track the status message now on display."""
+    _status_msg_info[skey] = (msg_id, window_id, text)
+    _status_shown_at[skey] = time.monotonic()
+
+
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
     return _message_queues.get(user_id)
@@ -199,9 +263,22 @@ def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     # - tool_result: edits previous message, merging would cause order issues
     if base.content_type in ("tool_use", "tool_result"):
         return False
-    if candidate.content_type in ("tool_use", "tool_result"):
-        return False
-    return True
+    return candidate.content_type not in ("tool_use", "tool_result")
+
+
+def _append_parts(parts: list[str], more: list[str]) -> None:
+    """Add a merged task's parts, each joined onto the message before it if
+    the two still fit one Telegram message once converted to MarkdownV2.
+
+    Every part is sent as its own message, so joining is what saves requests.
+    """
+    for part in more:
+        if parts:
+            joined = f"{parts[-1]}\n\n{part}"
+            if len(_ensure_formatted(joined)) <= MessageLimit.MAX_TEXT_LENGTH:
+                parts[-1] = joined
+                continue
+        parts.append(part)
 
 
 async def _merge_content_tasks(
@@ -224,6 +301,7 @@ async def _merge_content_tasks(
     merged_images: list[tuple[str, bytes]] = list(first.image_data or [])
     merged_tables: list[ParsedTable] = list(first.tables or [])
     merged_tickets: list[DeliveryTicket] = list(first.tickets)
+    read_at = first.read_at
     current_length = sum(len(p) for p in merged_parts)
     merge_count = 0
 
@@ -244,10 +322,11 @@ async def _merge_content_tasks(
                 remaining = items[i:]
                 break
 
-            merged_parts.extend(task.parts)
+            _append_parts(merged_parts, task.parts)
             merged_images.extend(task.image_data or [])
             merged_tables.extend(task.tables or [])
             merged_tickets.extend(task.tickets)
+            read_at = _earliest(read_at, task.read_at)
             current_length += task_length
             merge_count += 1
 
@@ -272,9 +351,65 @@ async def _merge_content_tasks(
             image_data=merged_images or None,
             tables=merged_tables or None,
             tickets=merged_tickets,
+            read_at=read_at,
         ),
         merge_count,
     )
+
+
+def _earliest(a: float | None, b: float | None) -> float | None:
+    """The earlier of two read times, ignoring unknown ones."""
+    if a is None or b is None:
+        return a if b is None else b
+    return min(a, b)
+
+
+def _is_result_of(tool_use: MessageTask, candidate: MessageTask) -> bool:
+    """True if candidate is the tool_result for this tool_use (same topic)."""
+    return (
+        candidate.task_type == "content"
+        and candidate.content_type == "tool_result"
+        and candidate.tool_use_id == tool_use.tool_use_id
+        and candidate.window_id == tool_use.window_id
+        and candidate.thread_id == tool_use.thread_id
+    )
+
+
+async def _absorb_queued_tool_result(
+    queue: asyncio.Queue[MessageTask],
+    task: MessageTask,
+    lock: asyncio.Lock,
+) -> tuple[MessageTask, int]:
+    """Send a tool_use as its tool_result when the result is already queued.
+
+    Normally the tool_use goes out first and its result edits it later. When
+    the queue is backed up, the result is often waiting behind it already;
+    sending the result in the tool_use's place ends with the same message for
+    one request instead of a send plus an edit. The result text starts with
+    the same tool summary line the tool_use would have shown.
+
+    Returns: (task_to_send, absorbed_count) — absorbed_count is 1 when the
+    queued result was taken out of the queue (caller marks it done).
+    """
+    if task.content_type != "tool_use" or not task.tool_use_id:
+        return task, 0
+
+    async with lock:
+        items = _inspect_queue(queue)
+        result = next((item for item in items if _is_result_of(task, item)), None)
+        for item in items:
+            if item is result:
+                continue
+            queue.put_nowait(item)
+            # Compensate: already counted when first enqueued
+            queue.task_done()
+
+    if result is None:
+        return task, 0
+    # The tool_use's receipts ride along: its source is delivered with the result
+    result.tickets = task.tickets + result.tickets
+    result.read_at = _earliest(task.read_at, result.read_at)
+    return result, 1
 
 
 async def _message_queue_worker(bot: Bot, user_id: int) -> None:
@@ -307,21 +442,37 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                     logger.info("Flood control lifted for user %d", user_id)
 
                 if task.task_type == "content":
+                    # A tool_use whose result is already queued goes out as that result
+                    task, absorbed = await _absorb_queued_tool_result(queue, task, lock)
+                    if absorbed:
+                        logger.debug(
+                            f"Sent tool_result in place of its tool_use "
+                            f"{task.tool_use_id} for user {user_id}"
+                        )
                     # Try to merge consecutive content tasks
                     task, merge_count = await _merge_content_tasks(queue, task, lock)
                     if merge_count > 0:
                         logger.debug(f"Merged {merge_count} tasks for user {user_id}")
-                        # Mark merged tasks as done
-                        for _ in range(merge_count):
-                            queue.task_done()
-                try:
-                    await _deliver_task(bot, user_id, task)
-                except Exception as e:
-                    # Permanent failure: retrying the same request can't help
-                    logger.error(
-                        f"Error processing message task for user {user_id}: {e}"
+                    # Mark absorbed and merged tasks as done
+                    for _ in range(absorbed + merge_count):
+                        queue.task_done()
+                chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+                if is_topic_gone(chat_id, task.thread_id):
+                    # Topic deleted: nowhere to deliver, the poller unbinds it
+                    logger.debug(
+                        f"Dropped {task.task_type} task for deleted topic "
+                        f"{task.thread_id} (user {user_id})"
                     )
-                # Delivered or permanently failed — either way this task no
+                else:
+                    try:
+                        with request_purpose(_task_label(task), task.read_at):
+                            await _deliver_task(bot, user_id, task)
+                    except Exception as e:
+                        # Permanent failure: retrying the same request can't help
+                        logger.error(
+                            f"Error processing message task for user {user_id}: {e}"
+                        )
+                # Delivered, dropped or permanently failed — either way this task no
                 # longer holds back the monitor offset. A cancelled task never
                 # gets here, so a restart re-sends it.
                 for ticket in task.tickets:
@@ -333,6 +484,15 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
             break
         except Exception as e:
             logger.error(f"Unexpected error in queue worker for user {user_id}: {e}")
+
+
+def _task_label(task: MessageTask) -> str:
+    """Request log label: the content type, or what else the task is."""
+    if task.task_type == "content":
+        return task.content_type
+    if task.task_type in ("status_update", "status_clear"):
+        return "status"
+    return task.task_type
 
 
 def _retry_after_seconds(error: RetryAfter) -> int:
@@ -482,6 +642,8 @@ async def _process_table_task(bot: Bot, user_id: int, task: MessageTask) -> None
     prose → table → prose arrives in that order.
     """
     chat_id = session_manager.resolve_chat_id(user_id, task.thread_id)
+    # The table is a new message: the status message must not stay above it
+    await _do_clear_status_message(bot, user_id, task.thread_id or 0)
     await _send_task_tables(bot, chat_id, task)
     await _check_and_send_status(bot, user_id, task.window_id or "", task.thread_id)
 
@@ -569,8 +731,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         # Looked up, not popped: a transient error must leave it for the retry
         edit_msg_id = _tool_msg_ids.get(_tkey)
         if edit_msg_id is not None:
-            # Clear status message first
-            await _do_clear_status_message(bot, user_id, tid)
+            # The status message (if any) stays: it is still below the edited
+            # tool_use message, so deleting and re-sending it would buy nothing
             await _pace(chat_id)
             if await _edit_tool_message(bot, chat_id, edit_msg_id, task):
                 task.parts = []
@@ -614,7 +776,11 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
         _tool_msg_ids[(task.tool_use_id, user_id, tid)] = last_msg_id
 
-    # 4. Send attachments: tables (native, PNG fallback), then images
+    # 4. Send attachments: tables (native, PNG fallback), then images. They
+    # are new messages, so a status message still shown (after an in-place
+    # tool_result edit) goes first to keep the status last.
+    if task.tables or task.image_data:
+        await _do_clear_status_message(bot, user_id, tid)
     await _send_task_attachments(bot, chat_id, task)
 
     # 5. After content, check and send status
@@ -780,34 +946,21 @@ async def _process_status_update_task(
         await _do_clear_status_message(bot, user_id, tid)
         return
 
-    current_info = _status_msg_info.get(skey)
-    if current_info and current_info[1] == wid and current_info[2] == status_text:
-        return  # Same content, nothing to send
-    if not _try_pace(chat_id):
-        return  # Chat is busy; the next poll brings a fresher status anyway
+    if _status_is_current(skey, wid, status_text):
+        return  # Same content (or only its counters moved lately)
+    if not _status_slot_free(bot, chat_id):
+        return  # Other traffic comes first; the next poll brings a fresher status
 
+    current_info = _status_msg_info.get(skey)
     if current_info:
-        msg_id, stored_wid, last_text = current_info
+        msg_id, stored_wid, _ = current_info
 
         if stored_wid != wid:
             # Window changed - delete old and send new
             await _do_clear_status_message(bot, user_id, tid)
             await _do_send_status_message(bot, user_id, tid, wid, status_text)
-        elif status_text == last_text:
-            # Same content, skip edit
-            return
         else:
             # Same window, text changed - edit in place
-            # Send typing indicator when Claude is working
-            if "esc to interrupt" in status_text.lower():
-                try:
-                    await bot.send_chat_action(
-                        chat_id=chat_id, action=ChatAction.TYPING
-                    )
-                except RetryAfter:
-                    raise
-                except Exception:
-                    pass
             try:
                 await bot.edit_message_text(
                     chat_id=chat_id,
@@ -816,7 +969,7 @@ async def _process_status_update_task(
                     parse_mode=PARSE_MODE,
                     link_preview_options=NO_LINK_PREVIEW,
                 )
-                _status_msg_info[skey] = (msg_id, wid, status_text)
+                _remember_status(skey, msg_id, wid, status_text)
             except RetryAfter:
                 raise
             except Exception:
@@ -827,7 +980,7 @@ async def _process_status_update_task(
                         text=status_text,
                         link_preview_options=NO_LINK_PREVIEW,
                     )
-                    _status_msg_info[skey] = (msg_id, wid, status_text)
+                    _remember_status(skey, msg_id, wid, status_text)
                 except RetryAfter:
                     raise
                 except Exception as e:
@@ -850,30 +1003,23 @@ async def _do_send_status_message(
     skey = (user_id, thread_id_or_0)
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-    # Safety net: delete any orphaned status message before sending a new one.
-    # This catches edge cases where tracking was cleared without deleting the message.
-    old = _status_msg_info.pop(skey, None)
-    if old:
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=old[0])
-        except Exception:
-            pass
-    # Send typing indicator when Claude is working
-    if "esc to interrupt" in text.lower():
-        try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-        except RetryAfter:
-            raise
-        except Exception:
-            pass
-    sent = await send_with_fallback(
-        bot,
-        chat_id,
-        text,
-        **_send_kwargs(thread_id),  # type: ignore[arg-type]
-    )
+    with request_purpose("status"):
+        # Safety net: delete any orphaned status message before sending a new one.
+        # Catches edge cases where tracking was cleared without deleting the message.
+        old = _status_msg_info.pop(skey, None)
+        if old:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=old[0])
+            except Exception:
+                pass
+        sent = await send_with_fallback(
+            bot,
+            chat_id,
+            text,
+            **_send_kwargs(thread_id),  # type: ignore[arg-type]
+        )
     if sent:
-        _status_msg_info[skey] = (sent.message_id, window_id, text)
+        _remember_status(skey, sent.message_id, window_id, text)
 
 
 async def _do_clear_status_message(
@@ -888,7 +1034,8 @@ async def _do_clear_status_message(
         msg_id = info[0]
         chat_id = session_manager.resolve_chat_id(user_id, thread_id_or_0 or None)
         try:
-            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            with request_purpose("status"):
+                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.debug(f"Failed to delete status message {msg_id}: {e}")
 
@@ -904,6 +1051,11 @@ async def _check_and_send_status(
     queue = _message_queues.get(user_id)
     if queue and not queue.empty():
         return
+    # A status message still tracked for this window is still the last message
+    # (every new message consumes it), so the poller just edits it in place
+    info = _status_msg_info.get((user_id, thread_id or 0))
+    if info and info[1] == window_id:
+        return
     w = await tmux_manager.find_window_by_id(window_id)
     if not w:
         return
@@ -914,7 +1066,8 @@ async def _check_and_send_status(
 
     tid = thread_id or 0
     status_line = parse_status_line(pane_text)
-    if status_line and _try_pace(session_manager.resolve_chat_id(user_id, thread_id)):
+    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+    if status_line and _status_slot_free(bot, chat_id):
         await _do_send_status_message(bot, user_id, tid, window_id, status_line)
 
 
@@ -930,11 +1083,12 @@ async def enqueue_content_message(
     image_data: list[tuple[str, bytes]] | None = None,
     tables: list[ParsedTable] | None = None,
     ticket: DeliveryTicket | None = None,
+    read_at: float | None = None,
 ) -> None:
     """Enqueue a content message task.
 
     `ticket` is the source message's delivery receipt; the task holds a
-    reference until it has been sent.
+    reference until it has been sent. `read_at` is when the bot read it.
     """
     logger.debug(
         "Enqueue content: user=%d, window_id=%s, content_type=%s",
@@ -955,6 +1109,7 @@ async def enqueue_content_message(
         image_data=image_data,
         tables=tables,
         tickets=[ticket.hold()] if ticket else [],
+        read_at=read_at,
     )
     queue.put_nowait(task)
 
@@ -966,6 +1121,7 @@ async def enqueue_table_message(
     table: ParsedTable,
     thread_id: int | None = None,
     ticket: DeliveryTicket | None = None,
+    read_at: float | None = None,
 ) -> None:
     """Enqueue one table as its own message, preserving its position."""
     logger.debug("Enqueue table: user=%d, window_id=%s", user_id, window_id)
@@ -977,6 +1133,7 @@ async def enqueue_table_message(
             thread_id=thread_id,
             tables=[table],
             tickets=[ticket.hold()] if ticket else [],
+            read_at=read_at,
         )
     )
 
@@ -987,6 +1144,7 @@ async def enqueue_voice_message(
     window_id: str,
     text: str,
     thread_id: int | None = None,
+    read_at: float | None = None,
 ) -> None:
     """Enqueue a TTS voice reply of the final assistant message."""
     logger.debug("Enqueue voice: user=%d, window_id=%s", user_id, window_id)
@@ -997,6 +1155,7 @@ async def enqueue_voice_message(
             text=text,
             window_id=window_id,
             thread_id=thread_id,
+            read_at=read_at,
         )
     )
 
@@ -1008,7 +1167,7 @@ async def enqueue_status_update(
     status_text: str | None,
     thread_id: int | None = None,
 ) -> None:
-    """Enqueue status update. Skipped if text unchanged or during flood control."""
+    """Enqueue status update. Skipped if nothing to show or during flood control."""
     # Don't enqueue during flood control — they'd just be dropped
     flood_end = _flood_until.get(user_id, 0)
     if flood_end > time.monotonic():
@@ -1016,12 +1175,9 @@ async def enqueue_status_update(
 
     tid = thread_id or 0
 
-    # Deduplicate: skip if text matches what's already displayed
-    if status_text:
-        skey = (user_id, tid)
-        info = _status_msg_info.get(skey)
-        if info and info[1] == window_id and info[2] == status_text:
-            return
+    # Deduplicate: skip if what's displayed needs no update
+    if status_text and _status_is_current((user_id, tid), window_id, status_text):
+        return
 
     queue = get_or_create_queue(bot, user_id)
 
@@ -1042,6 +1198,7 @@ def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
     """Clear status message tracking for a user (and optionally a specific thread)."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
+    _status_shown_at.pop(skey, None)
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:

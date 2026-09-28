@@ -40,6 +40,12 @@ target-version = ["py312"]
 [tool.ruff]
 target-version = "py312"
 
+[tool.ruff.lint]
+# `except Exception` is deliberate here: Telegram sends fall back to plain
+# text, best-effort cleanup (e.g. deleting a status message) may fail, and
+# the background loops must survive any single error.
+ignore = ["BLE001", "S110"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

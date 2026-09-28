@@ -19,9 +19,8 @@ from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from ..session import ClaudeSession
-
 from ..config import config
+from ..session import ClaudeSession
 from .callback_data import (
     CB_DIR_CANCEL,
     CB_DIR_CONFIRM,

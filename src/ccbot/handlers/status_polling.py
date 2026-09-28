@@ -5,42 +5,37 @@ Provides background polling of terminal status lines for all active users:
   - Detects interactive UIs (permission prompts) not triggered via JSONL
   - Updates status messages in Telegram
   - Polls thread_bindings (each topic = one window)
-  - Periodically probes topic existence via unpin_all_forum_topic_messages
-    (silent no-op when no pins); cleans up deleted topics (kills tmux window
-    + unbinds thread)
+  - Cleans up deleted topics (kills tmux window + unbinds thread) once a send
+    to them has failed — Telegram sends no update on deletion, and probing
+    every topic would spend the bot-wide send quota
 
 Key components:
   - STATUS_POLL_INTERVAL: Polling frequency (5 seconds)
-  - TOPIC_CHECK_INTERVAL: Topic existence probe frequency (60 seconds)
   - status_poll_loop: Background polling task
   - update_status_message: Poll and enqueue status updates
 """
 
 import asyncio
 import logging
-import time
 
 from telegram import Bot
-from telegram.error import BadRequest
 
 from ..session import session_manager
 from ..terminal_parser import is_interactive_ui, parse_status_line
 from ..tmux_manager import tmux_manager
+from .cleanup import clear_topic_state
 from .interactive_ui import (
     clear_interactive_msg,
     get_interactive_window,
     handle_interactive_ui,
 )
-from .cleanup import clear_topic_state
 from .message_queue import enqueue_status_update, get_message_queue
+from .message_sender import is_topic_gone
 
 logger = logging.getLogger(__name__)
 
 # Status polling interval
 STATUS_POLL_INTERVAL = 5.0  # seconds - keep status edits from eating the send quota
-
-# Topic existence probe interval
-TOPIC_CHECK_INTERVAL = 60.0  # seconds
 
 
 async def update_status_message(
@@ -122,51 +117,27 @@ async def update_status_message(
 async def status_poll_loop(bot: Bot) -> None:
     """Background task to poll terminal status for all thread-bound windows."""
     logger.info("Status polling started (interval: %ss)", STATUS_POLL_INTERVAL)
-    last_topic_check = 0.0
     while True:
         try:
-            # Periodic topic existence probe
-            now = time.monotonic()
-            if now - last_topic_check >= TOPIC_CHECK_INTERVAL:
-                last_topic_check = now
-                for user_id, thread_id, wid in list(
-                    session_manager.iter_thread_bindings()
-                ):
-                    try:
-                        await bot.unpin_all_forum_topic_messages(
-                            chat_id=session_manager.resolve_chat_id(user_id, thread_id),
-                            message_thread_id=thread_id,
-                        )
-                    except BadRequest as e:
-                        if "Topic_id_invalid" in str(e):
-                            # Topic deleted — kill window, unbind, and clean up state
-                            w = await tmux_manager.find_window_by_id(wid)
-                            if w:
-                                await tmux_manager.kill_window(w.window_id)
-                            session_manager.unbind_thread(user_id, thread_id)
-                            await clear_topic_state(user_id, thread_id, bot)
-                            logger.info(
-                                "Topic deleted: killed window_id '%s' and "
-                                "unbound thread %d for user %d",
-                                wid,
-                                thread_id,
-                                user_id,
-                            )
-                        else:
-                            logger.debug(
-                                "Topic probe error for %s: %s",
-                                wid,
-                                e,
-                            )
-                    except Exception as e:
-                        logger.debug(
-                            "Topic probe error for %s: %s",
-                            wid,
-                            e,
-                        )
-
             for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
                 try:
+                    # Topic deleted (a send to it failed) — kill window, unbind
+                    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
+                    if is_topic_gone(chat_id, thread_id):
+                        w = await tmux_manager.find_window_by_id(wid)
+                        if w:
+                            await tmux_manager.kill_window(w.window_id)
+                        session_manager.unbind_thread(user_id, thread_id)
+                        await clear_topic_state(user_id, thread_id, bot)
+                        logger.info(
+                            "Topic deleted: killed window_id '%s' and "
+                            "unbound thread %d for user %d",
+                            wid,
+                            thread_id,
+                            user_id,
+                        )
+                        continue
+
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
