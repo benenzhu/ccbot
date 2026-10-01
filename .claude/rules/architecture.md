@@ -7,6 +7,7 @@
 │  - /history: Paginated message history (default: latest page)      │
 │  - /screenshot: Capture tmux pane as PNG                           │
 │  - /esc: Send Escape to interrupt Claude                           │
+│  - /fork: Fork the session into a new topic, with a task           │
 │  - Send text → Claude Code via tmux keystrokes                     │
 │  - Forward /commands to Claude Code                                │
 │  - Create sessions via directory browser in unbound topics         │

@@ -533,3 +533,61 @@ class TestCompactReplay:
         messages = await monitor.check_for_updates({"s"})  # not marked as replay
 
         assert "tool_use" in [m.content_type for m in messages]
+
+
+class TestSessionTitle:
+    """Claude's /rename title, handed on only when it changes."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path):
+        return SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+
+    @staticmethod
+    def _title(title: str, session_id: str = "s") -> dict:
+        return {"type": "custom-title", "customTitle": title, "sessionId": session_id}
+
+    async def _read(self, monitor, path, entries, monkeypatch):
+        with path.open("a") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in entries))
+        if monitor.state.get_session("s") is None:
+            monitor.state.update_session(
+                TrackedSession(session_id="s", file_path=str(path))
+            )
+        monkeypatch.setattr(
+            monitor,
+            "scan_projects",
+            AsyncMock(return_value=[SessionInfo("s", path)]),
+        )
+        await monitor.check_for_updates({"s"})
+        return monitor.take_renames()
+
+    async def test_a_changed_title_is_handed_on_once(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        path = tmp_path / "session.jsonl"
+        first = await self._read(
+            monitor,
+            path,
+            [
+                make_jsonl_entry("user", [{"type": "text", "text": "hi"}]),
+                self._title("draft"),
+                self._title("moe_writing"),  # the latest title in a read wins
+                self._title("forked-from", session_id="source"),  # a fork's source
+            ],
+            monkeypatch,
+        )
+        assert first == [("s", "moe_writing")]
+
+        # Claude re-appends the same title every so often: not a rename
+        assert (
+            await self._read(monitor, path, [self._title("moe_writing")], monkeypatch)
+            == []
+        )
+
+        again = await self._read(
+            monitor, path, [self._title("ccbot_rename")], monkeypatch
+        )
+        assert again == [("s", "ccbot_rename")]

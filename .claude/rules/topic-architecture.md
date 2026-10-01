@@ -62,7 +62,11 @@ SessionMonitor reads new message (session_id = "uuid-xxx")
 
 **Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: `--resume` makes the hook report a new session_id but messages continue writing to the original JSONL file; the bot overrides window_state to track the original session_id.
 
+**Fork command**: `/fork <name>` in a bound topic (a task may follow on the next lines) creates a new topic, starts `claude --resume <sid> --fork-session` in a new tmux window at the same cwd (new session id; inherited history is not re-sent), binds it, and names topic and window `<name>`. It then sends `/rename <name>` to the fork, so the Naming rule below keeps all three in step, followed by the task prefixed with `FORK_TASK_PROMPT` ("you are a fork, leave the original work to the original window"). If the launch fails, the new topic is deleted.
+
 **Topic lifecycle**: Closing/deleting a topic auto-kills the associated tmux window and unbinds the thread. Closing arrives as an update; deletion does not, so it is detected when a send to the topic fails with "message thread not found" (`is_topic_gone`) and cleaned up on the next status poll — there is no periodic probe. Stale bindings (window deleted externally) are cleaned up by the status polling loop.
+
+**Naming**: Claude's session name is the source of truth. `/rename <name>` (sent in the topic — it is forwarded to Claude — or typed in the terminal) makes Claude write a `custom-title` JSONL line; the monitor hands a *changed* title to `handle_session_renamed`, which renames the tmux window, its display name and the topic (Claude re-appends the same title often, so unchanged titles cost nothing). Renaming the topic in Telegram renames the tmux window (not Claude's name). The session picker shows the custom title.
 
 ## Session Lifecycle
 

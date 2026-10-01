@@ -8,6 +8,9 @@ Runs an async polling loop that:
 
 Delivery is at-least-once: every NewMessage carries a DeliveryTicket that pins
 the persisted offset at its JSONL line until the message has been sent.
+Session names: Claude's /rename writes a custom-title line; a title that
+changed is handed to the rename callback (which renames window and topic).
+
 History replays are compacted (config.replay_compact): thinking and tool
 messages are dropped, each run of them marked by a divider line at the top of
 the next message kept.
@@ -95,6 +98,11 @@ class SessionMonitor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._rename_callback: Callable[[str, str], Awaitable[None]] | None = None
+        # Last session title (/rename) seen per session, and changes not yet
+        # handed to the rename callback
+        self._titles: dict[str, str] = {}
+        self._renames: list[tuple[str, str]] = []
         # Per-session pending tool_use state carried across poll cycles
         self._pending_tools: dict[str, dict[str, Any]] = {}  # session_id -> pending
         # Track last known session_map for detecting changes
@@ -141,6 +149,37 @@ class SessionMonitor:
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
         self._message_callback = callback
+
+    def set_rename_callback(
+        self, callback: Callable[[str, str], Awaitable[None]]
+    ) -> None:
+        """Called with (session_id, title) when a session's /rename title changes."""
+        self._rename_callback = callback
+
+    def _note_title(self, session_id: str, entries: list[dict[str, Any]]) -> None:
+        """Queue a rename when the session's title (Claude's /rename) changes.
+
+        Claude Code re-appends the current title line every so often, so only a
+        title different from the last one seen counts. Forks carry the source
+        session's title lines, which name that session, not this one.
+        """
+        title = None
+        for entry in entries:
+            if (
+                entry.get("type") == "custom-title"
+                and entry.get("sessionId", session_id) == session_id
+                and isinstance(entry.get("customTitle"), str)
+                and entry["customTitle"].strip()
+            ):
+                title = entry["customTitle"].strip()
+        if title and self._titles.get(session_id) != title:
+            self._titles[session_id] = title
+            self._renames.append((session_id, title))
+
+    def take_renames(self) -> list[tuple[str, str]]:
+        """Title changes noted since the last call, as (session_id, title)."""
+        renames, self._renames = self._renames, []
+        return renames
 
     async def _get_active_cwds(self) -> set[str]:
         """Get normalized cwds of all active tmux windows."""
@@ -424,6 +463,7 @@ class SessionMonitor:
 
                 line_offsets = [offset for offset, _ in new_lines]
                 new_entries = [entry for _, entry in new_lines]
+                self._note_title(session_info.session_id, new_entries)
 
                 if new_entries:
                     logger.debug(
@@ -652,6 +692,13 @@ class SessionMonitor:
                         # nobody queued counts as delivered right here.
                         if msg.ticket:
                             msg.ticket.release()
+
+                for session_id, title in self.take_renames():
+                    try:
+                        if self._rename_callback:
+                            await self._rename_callback(session_id, title)
+                    except Exception as e:
+                        logger.error(f"Rename callback error: {e}")
 
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")

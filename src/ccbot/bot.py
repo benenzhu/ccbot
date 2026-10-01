@@ -29,7 +29,7 @@ Handler modules (in handlers/):
   - status_polling: Terminal status polling
   - response_builder: Response message building
 
-Key functions: create_bot(), handle_new_message().
+Key functions: create_bot(), handle_new_message(), handle_session_renamed().
 """
 
 import asyncio
@@ -47,7 +47,7 @@ from telegram import (
     InputMediaDocument,
     Update,
 )
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ForumTopicLimit
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -171,6 +171,7 @@ CC_COMMANDS: dict[str, str] = {
     "help": "↗ Show Claude Code help",
     "memory": "↗ Edit CLAUDE.md",
     "model": "↗ Switch AI model",
+    "rename": "↗ Rename session (topic and tmux window follow)",
 }
 
 
@@ -536,6 +537,149 @@ async def topic_edited_handler(
         user.id,
         thread_id,
     )
+
+
+async def handle_session_renamed(session_id: str, title: str, bot: Bot) -> None:
+    """Carry Claude's session name (/rename) to its tmux windows and topics.
+
+    Claude's name is the one users set (/rename in the topic is forwarded to
+    Claude, or typed in the terminal); window and topic names follow it.
+    """
+    name = title[: ForumTopicLimit.MAX_NAME_LENGTH]
+    renamed: set[str] = set()
+    for user_id, wid, thread_id in await session_manager.find_users_for_session(
+        session_id
+    ):
+        if wid not in renamed:
+            old_name = session_manager.get_display_name(wid)
+            if old_name == name:
+                continue  # Claude re-writes its title; nothing changed
+            await tmux_manager.rename_window(wid, name)
+            session_manager.update_display_name(wid, name)
+            renamed.add(wid)
+            logger.info(
+                "Session renamed: '%s' -> '%s' (window=%s)", old_name, name, wid
+            )
+        try:
+            await bot.edit_forum_topic(
+                chat_id=session_manager.resolve_chat_id(user_id, thread_id),
+                message_thread_id=thread_id,
+                name=name,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to rename topic {thread_id}: {e}")
+
+
+# /fork: the task is prefixed so the fork leaves the original work alone
+FORK_TASK_PROMPT = (
+    "你是从原会话 fork 出来的新窗口。原来的任务由原窗口继续，你不要接着做。"
+    "现在请处理下面这件事：\n\n{task}"
+)
+# Pause between /rename and the task typed after it, so /rename has run
+FORK_RENAME_SETTLE_SECONDS = 1.0
+
+
+def _parse_fork_command(text: str) -> tuple[str, str]:
+    """'/fork <name>' + task on the following lines → (name, task)."""
+    first, _, rest = text.partition("\n")
+    parts = first.split(maxsplit=1)  # ["/fork" or "/fork@bot", name]
+    name = " ".join(parts[1].split()) if len(parts) > 1 else ""
+    return name, rest.strip()
+
+
+async def fork_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fork this topic's session into a new topic: /fork <name>, task below.
+
+    The fork runs in its own tmux window (claude --resume --fork-session: the
+    whole conversation so far, as a new session) bound to a new topic. Topic,
+    window and Claude session are all named <name>. A task on the following
+    lines is sent prefixed with FORK_TASK_PROMPT; the original window carries
+    on with its own work.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id) or not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    # Capture group chat_id for supergroup forum topic routing (see session.py)
+    chat = update.effective_chat
+    in_group = bool(chat and chat.type in ("group", "supergroup"))
+    if chat and in_group:
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    name, task = _parse_fork_command(update.message.text or "")
+    if not name:
+        await safe_reply(
+            update.message, "Usage: /fork <name>\n<task for the fork (optional)>"
+        )
+        return
+    name = name[: ForumTopicLimit.MAX_NAME_LENGTH]
+
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    state = session_manager.get_window_state(wid) if wid else None
+    session_file = session_manager.session_file_for_window(wid) if wid else None
+    if not wid or not state or not state.session_id or not session_file:
+        await safe_reply(update.message, "❌ No Claude session in this topic to fork.")
+        return
+
+    chat_id = session_manager.resolve_chat_id(user.id, thread_id)
+    try:
+        topic = await context.bot.create_forum_topic(chat_id=chat_id, name=name)
+    except Exception as e:
+        await safe_reply(update.message, f"❌ Could not create a topic: {e}")
+        return
+    new_thread = topic.message_thread_id
+    if chat and in_group:
+        session_manager.set_group_chat_id(user.id, new_thread, chat.id)
+
+    try:
+        ok, message, _, new_wid, fork_sid = await _launch_session_window(
+            state.cwd,
+            resume_session_id=state.session_id,
+            resume_file_path=str(session_file),
+            fork_session=True,
+        )
+    except _SourceUnreadableError:
+        ok, message, new_wid, fork_sid = False, "source session unreadable", "", None
+    if not ok:
+        try:  # don't leave an empty topic behind
+            await context.bot.delete_forum_topic(
+                chat_id=chat_id, message_thread_id=new_thread
+            )
+        except Exception as e:
+            logger.debug(f"Failed to delete topic {new_thread}: {e}")
+        await safe_reply(update.message, f"❌ Fork failed: {message}")
+        return
+
+    source = session_manager.get_display_name(wid)
+    session_manager.bind_thread(user.id, new_thread, new_wid, window_name=name)
+    await tmux_manager.rename_window(new_wid, name)
+    logger.info(
+        "Forked '%s' (%s) into '%s' (window=%s, session=%s, user=%d, thread=%d)",
+        source,
+        state.session_id,
+        name,
+        new_wid,
+        fork_sid,
+        user.id,
+        new_thread,
+    )
+    await safe_reply(update.message, f"⑂ Forked into new topic “{name}”.")
+    await safe_send(
+        context.bot,
+        chat_id,
+        f"⑂ Forked from “{source}”." + (f"\n\nTask: {task}" if task else ""),
+        message_thread_id=new_thread,
+    )
+
+    await _await_session_start(new_wid, fork_sid, resumed=True)
+    # Claude's name is the one window and topic follow (handle_session_renamed)
+    await session_manager.send_to_window(new_wid, f"/rename {name}")
+    if task:
+        await asyncio.sleep(FORK_RENAME_SETTLE_SECONDS)
+        await session_manager.send_to_window(
+            new_wid, FORK_TASK_PROMPT.format(task=task)
+        )
 
 
 async def forward_command_handler(
@@ -1047,45 +1191,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Window creation helper ---
 
 
-async def _create_and_bind_window(
-    query: object,
-    context: ContextTypes.DEFAULT_TYPE,
-    user: object,
+class _SourceUnreadableError(Exception):
+    """The session to fork from could not be read."""
+
+
+async def _launch_session_window(
     selected_path: str,
-    pending_thread_id: int | None,
     resume_session_id: str | None = None,
     resume_file_path: str | None = None,
     replay_history: bool = False,
     fork_session: bool = False,
-) -> None:
-    """Create a tmux window, bind it to a topic, and forward pending text.
+) -> tuple[bool, str, str, str, str | None]:
+    """Start Claude Code in a new tmux window and route the window to its session.
 
-    Shared by directory confirmation, new session, resume, and fork actions.
-
-    On resume with replay_history=True, pre-seeds the monitor's byte offset to
-    0 so the next poll cycle replays the entire JSONL history to Telegram, and
-    discards any pending text so the user can review history first.
-
-    On resume with replay_history=False, pre-seeds the offset to the current
-    file size so only output produced after the resume is forwarded, and the
-    pending text is sent like a fresh session.
+    Returns (success, message, window_name, window_id, target_session_id);
+    target_session_id is the session the window is routed to (a fork's new
+    id), None for a fresh session. Raises _SourceUnreadableError when the
+    session to fork from can't be read.
 
     Forks get a new UUID before launch so monitoring and routing never touch
     the source session. Inherited messages are skipped by UUID without replay.
     """
-    from telegram import CallbackQuery, User
-
-    assert isinstance(query, CallbackQuery)
-    assert isinstance(user, User)
-
-    # Acknowledge the tap right away. Callback query IDs expire after a few
-    # seconds, and this function waits up to 15s for the SessionStart hook;
-    # answering at the end raised "Query is too old".
-    try:
-        await query.answer("Creating window…")
-    except BadRequest as e:
-        logger.debug("Callback answer failed (already expired?): %s", e)
-
     fork_session_id = str(uuid4()) if fork_session and resume_session_id else None
     target_session_id = fork_session_id or resume_session_id
     target_file_path = resume_file_path
@@ -1098,11 +1224,8 @@ async def _create_and_bind_window(
                 await session_monitor.skip_fork_history(
                     fork_session_id, resume_file_path
                 )
-            except OSError:
-                await safe_edit(
-                    query, "❌ Source session could not be read. Please retry."
-                )
-                return
+            except OSError as e:
+                raise _SourceUnreadableError from e
 
     # Pre-seed monitor offset BEFORE the window starts. Done before window
     # creation to avoid a race with the 2s poll loop.
@@ -1144,6 +1267,118 @@ async def _create_and_bind_window(
         resume_session_id=resume_session_id,
         fork_session_id=fork_session_id,
     )
+    if not success:
+        if fork_session_id and session_monitor is not None:
+            session_monitor.state.remove_session(fork_session_id)
+            session_monitor.state.save()
+            session_monitor._fork_history_uuids.pop(fork_session_id, None)
+        return False, message, "", "", None
+
+    # On resume, wire up routing (window_state.session_id + thread binding)
+    # BEFORE waiting for the hook. Otherwise the monitor's poll cycle can
+    # fire between hook write and bind_thread, dispatching replayed history
+    # messages with no active users → silently dropped.
+    if target_session_id:
+        ws = session_manager.get_window_state(created_wid)
+        ws.session_id = target_session_id
+        ws.cwd = str(selected_path)
+        ws.window_name = created_wname
+        session_manager._save_state()
+    return True, message, created_wname, created_wid, target_session_id
+
+
+async def _await_session_start(
+    created_wid: str, target_session_id: str | None, resumed: bool
+) -> None:
+    """Wait for the SessionStart hook, keeping the window on its target session."""
+    # Wait for Claude Code's SessionStart hook to register in session_map.
+    # Resume sessions take longer to start (loading session state), so use
+    # a longer timeout to avoid silently dropping messages.
+    hook_timeout = 15.0 if resumed else 5.0
+    hook_ok = await session_manager.wait_for_session_map_entry(
+        created_wid, timeout=hook_timeout
+    )
+
+    # If the hook reported a session_id that differs from target_session_id
+    # (e.g. on older Claude versions), the session_map sync may have
+    # overwritten ws.session_id. Restore it so the monitor routes to the
+    # expected JSONL (the new UUID for a fork, never the source).
+    if target_session_id:
+        ws = session_manager.get_window_state(created_wid)
+        if not hook_ok:
+            logger.warning(
+                "Hook timed out for resume window %s; routing already wired "
+                "with session_id=%s",
+                created_wid,
+                target_session_id,
+            )
+        elif ws.session_id != target_session_id:
+            logger.info(
+                "Resume override after hook: window %s session_id %s -> %s",
+                created_wid,
+                ws.session_id,
+                target_session_id,
+            )
+            ws.session_id = target_session_id
+            session_manager._save_state()
+
+
+async def _create_and_bind_window(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: object,
+    selected_path: str,
+    pending_thread_id: int | None,
+    resume_session_id: str | None = None,
+    resume_file_path: str | None = None,
+    replay_history: bool = False,
+    fork_session: bool = False,
+) -> None:
+    """Create a tmux window, bind it to a topic, and forward pending text.
+
+    Shared by directory confirmation, new session, resume, and fork actions.
+
+    On resume with replay_history=True, pre-seeds the monitor's byte offset to
+    0 so the next poll cycle replays the entire JSONL history to Telegram, and
+    discards any pending text so the user can review history first.
+
+    On resume with replay_history=False, pre-seeds the offset to the current
+    file size so only output produced after the resume is forwarded, and the
+    pending text is sent like a fresh session.
+
+    Window launch and fork setup live in _launch_session_window.
+    """
+    from telegram import CallbackQuery, User
+
+    assert isinstance(query, CallbackQuery)
+    assert isinstance(user, User)
+
+    # Acknowledge the tap right away. Callback query IDs expire after a few
+    # seconds, and this function waits up to 15s for the SessionStart hook;
+    # answering at the end raised "Query is too old".
+    try:
+        await query.answer("Creating window…")
+    except BadRequest as e:
+        logger.debug("Callback answer failed (already expired?): %s", e)
+
+    try:
+        (
+            success,
+            message,
+            created_wname,
+            created_wid,
+            target_session_id,
+        ) = await _launch_session_window(
+            selected_path,
+            resume_session_id=resume_session_id,
+            resume_file_path=resume_file_path,
+            replay_history=replay_history,
+            fork_session=fork_session,
+        )
+    except _SourceUnreadableError:
+        await safe_edit(query, "❌ Source session could not be read. Please retry.")
+        return
+    fork_session_id = target_session_id if fork_session and resume_session_id else None
     if success:
         logger.info(
             "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s, fork=%s)",
@@ -1155,17 +1390,6 @@ async def _create_and_bind_window(
             resume_session_id,
             fork_session_id,
         )
-
-        # On resume, wire up routing (window_state.session_id + thread binding)
-        # BEFORE waiting for the hook. Otherwise the monitor's poll cycle can
-        # fire between hook write and bind_thread, dispatching replayed history
-        # messages with no active users → silently dropped.
-        if target_session_id:
-            ws = session_manager.get_window_state(created_wid)
-            ws.session_id = target_session_id
-            ws.cwd = str(selected_path)
-            ws.window_name = created_wname
-            session_manager._save_state()
 
         resolved_chat: int = 0
         if pending_thread_id is not None:
@@ -1183,36 +1407,9 @@ async def _create_and_bind_window(
             except Exception as e:
                 logger.debug(f"Failed to rename topic: {e}")
 
-        # Wait for Claude Code's SessionStart hook to register in session_map.
-        # Resume sessions take longer to start (loading session state), so use
-        # a longer timeout to avoid silently dropping messages.
-        hook_timeout = 15.0 if resume_session_id else 5.0
-        hook_ok = await session_manager.wait_for_session_map_entry(
-            created_wid, timeout=hook_timeout
+        await _await_session_start(
+            created_wid, target_session_id, resumed=bool(resume_session_id)
         )
-
-        # If the hook reported a session_id that differs from target_session_id
-        # (e.g. on older Claude versions), the session_map sync may have
-        # overwritten ws.session_id. Restore it so the monitor routes to the
-        # expected JSONL (the new UUID for a fork, never the source).
-        if target_session_id:
-            ws = session_manager.get_window_state(created_wid)
-            if not hook_ok:
-                logger.warning(
-                    "Hook timed out for resume window %s; routing already wired "
-                    "with session_id=%s",
-                    created_wid,
-                    target_session_id,
-                )
-            elif ws.session_id != target_session_id:
-                logger.info(
-                    "Resume override after hook: window %s session_id %s -> %s",
-                    created_wid,
-                    ws.session_id,
-                    target_session_id,
-                )
-                ws.session_id = target_session_id
-                session_manager._save_state()
 
         if pending_thread_id is not None:
             action = "Forked into a new session" if fork_session_id else "Resumed"
@@ -1279,10 +1476,6 @@ async def _create_and_bind_window(
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
     else:
-        if fork_session_id and session_monitor is not None:
-            session_monitor.state.remove_session(fork_session_id)
-            session_monitor.state.save()
-            session_monitor._fork_history_uuids.pop(fork_session_id, None)
         await safe_edit(query, f"❌ {message}")
         if pending_thread_id is not None and context.user_data is not None:
             context.user_data.pop("_pending_thread_id", None)
@@ -2139,6 +2332,7 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("fork", "Fork session into a new topic: /fork <name>, task below"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -2166,6 +2360,11 @@ async def post_init(application: Application) -> None:
         await handle_new_message(msg, application.bot)
 
     monitor.set_message_callback(message_callback)
+
+    async def rename_callback(session_id: str, title: str) -> None:
+        await handle_session_renamed(session_id, title, application.bot)
+
+    monitor.set_rename_callback(rename_callback)
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
@@ -2224,6 +2423,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("btw", btw_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("fork", fork_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(
