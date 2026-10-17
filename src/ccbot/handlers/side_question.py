@@ -8,6 +8,11 @@ via OSC 52, reads that buffer, and closes the panel with Escape. Using the
 real /btw keeps the main conversation's prompt cache, unlike a separate
 `claude -p` run.
 
+The panel needs room: in a narrow window its hint bar wraps over lines, in a
+short one a long answer pushes the hint bar off screen. A window smaller than
+BTW_MIN_WIDTH x BTW_MIN_HEIGHT is enlarged while the side question runs, then
+put back; the parser also reads a wrapped hint bar.
+
 Key pieces: parse_btw_panel (pane text → PanelState), run_side_question.
 """
 
@@ -24,17 +29,25 @@ from ..tmux_manager import tmux_manager
 
 logger = logging.getLogger(__name__)
 
-# Panel anatomy (observed on Claude Code 2.1.263):
+# Panel anatomy (observed on Claude Code 2.1.263, 2.1.302):
 #     /btw <earlier question>            ← dim history lines, optional
 #     /btw <current question>            ← may be truncated with …
 #       ✢ Answering…                     ← pending
-#       <answer, indented 6 spaces>      ← settled
+#       <answer, indented 6 spaces>      ← settled, cut to the panel's height
 #     ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close
+# The hint bar (last) wraps over lines when the window is narrow, and is not
+# drawn when the window is too short for it below a long answer.
 _RE_QUESTION_LINE = re.compile(r"^\s*/btw\s")
 _RE_HINT_BAR = re.compile(r"Esc to close")
 _RE_SETTLED_HINT = re.compile(r"\bc to copy\b|Copied to clipboard")
 _RE_PENDING = re.compile(r"Answering…")
 _RE_ERROR = re.compile(r"Failed to get response|No response received")
+_HINT_MAX_LINES = 4  # lines a wrapped hint bar may take
+
+# A smaller window is enlarged to this while a side question runs (the hint
+# bar, ~80 columns with history, fits on one line and below a long answer)
+BTW_MIN_WIDTH = 100
+BTW_MIN_HEIGHT = 30
 
 # Windows with a side question in flight; a second /btw would type into the
 # open panel instead of starting a new question.
@@ -51,15 +64,32 @@ class PanelState:
     answer: str = ""  # text scraped from the panel body (screen-wrapped)
 
 
+def _find_hint_bar(lines: list[str]) -> tuple[int, str] | None:
+    """(first line, text) of the hint bar, the lowest block of lines that
+    reads "Esc to close" once its wrapped lines are joined."""
+    end = len(lines) - 1
+    while end >= 0:
+        if not lines[end].strip():
+            end -= 1
+            continue
+        start = end
+        while start > 0 and lines[start - 1].strip():
+            start -= 1
+        start = max(start, end - _HINT_MAX_LINES + 1)
+        text = " ".join(line.strip() for line in lines[start : end + 1])
+        if _RE_HINT_BAR.search(text):
+            return start, text
+        end = start - 1
+    return None
+
+
 def parse_btw_panel(pane_text: str) -> PanelState:
     """Locate the /btw panel in captured pane text and classify its state."""
     lines = pane_text.split("\n")
-    hint_idx = next(
-        (i for i in range(len(lines) - 1, -1, -1) if _RE_HINT_BAR.search(lines[i])),
-        None,
-    )
-    if hint_idx is None:
+    found = _find_hint_bar(lines)
+    if found is None:
         return PanelState()
+    hint_idx, hint = found
     q_idx = next(
         (i for i in range(hint_idx - 1, -1, -1) if _RE_QUESTION_LINE.match(lines[i])),
         None,
@@ -70,7 +100,6 @@ def parse_btw_panel(pane_text: str) -> PanelState:
     body = textwrap.dedent(
         "\n".join(line.rstrip() for line in lines[q_idx + 1 : hint_idx])
     ).strip("\n")
-    hint = lines[hint_idx]
 
     err = _RE_ERROR.search(body)
     if err:
@@ -131,6 +160,40 @@ async def _close_panel(window_id: str) -> None:
     await tmux_manager.send_keys(window_id, "\x1b", enter=False)
 
 
+async def _make_room(window_id: str) -> tuple[int, int] | None:
+    """Enlarge a window smaller than the panel needs; its old size, or None."""
+    out = await _tmux(
+        "display-message", "-p", "-t", window_id, "#{window_width} #{window_height}"
+    )
+    try:
+        width, height = (int(n) for n in (out or "").split())
+    except ValueError:
+        return None
+    if width >= BTW_MIN_WIDTH and height >= BTW_MIN_HEIGHT:
+        return None
+    resized = await _tmux(
+        "resize-window",
+        "-t",
+        window_id,
+        "-x",
+        str(max(width, BTW_MIN_WIDTH)),
+        "-y",
+        str(max(height, BTW_MIN_HEIGHT)),
+    )
+    if resized is None:
+        return None
+    logger.info("Enlarged %s from %dx%d for a side question", window_id, width, height)
+    await asyncio.sleep(0.5)  # let the TUI redraw at the new size
+    return width, height
+
+
+async def _restore_size(window_id: str, size: tuple[int, int]) -> None:
+    width, height = size
+    await _tmux("resize-window", "-t", window_id, "-x", str(width), "-y", str(height))
+    # resize-window pinned the size (window-size manual): follow clients again
+    await _tmux("set-option", "-w", "-u", "-t", window_id, "window-size")
+
+
 async def run_side_question(
     window_id: str,
     question: str,
@@ -142,9 +205,13 @@ async def run_side_question(
         return False, "a side question is already in progress for this window"
     timeout = config.btw_timeout if timeout is None else timeout
     _active_windows.add(window_id)
+    old_size = None
     try:
+        old_size = await _make_room(window_id)
         return await _run(window_id, question, timeout, poll_interval)
     finally:
+        if old_size is not None:
+            await _restore_size(window_id, old_size)
         _active_windows.discard(window_id)
 
 

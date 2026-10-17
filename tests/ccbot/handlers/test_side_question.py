@@ -42,6 +42,30 @@ FAILED = """\
     ↑/↓ to scroll · x to clear history · Esc to close
 """
 
+# Captured from Claude Code 2.1.302 in a 40-column window: the hint bar wraps
+NARROW = """\
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+    /btw what is 2+2? answer in one s…
+    /btw what is 3+3? one sentence
+
+      3+3 等于 6。
+
+    ⇧←/→ to browse · c to copy · f to
+    fork · x to clear history · Esc to
+    close
+"""
+
+# 70x10 with a long answer: no room left for the hint bar
+SHORT = """\
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+
+    /btw list 12 prime numbers, one per line
+
+      前 12 个质数如下：
+                                                                    ↓
+"""
+
 
 class TestParseBtwPanel:
     def test_absent(self):
@@ -60,6 +84,14 @@ class TestParseBtwPanel:
     def test_error(self):
         st = parse_btw_panel(FAILED)
         assert st.present and st.error == "Failed to get response"
+
+    def test_hint_bar_wrapped_by_a_narrow_window(self):
+        st = parse_btw_panel(NARROW)
+        assert st.present and st.settled
+        assert st.answer == "3+3 等于 6。"
+
+    def test_a_short_window_hides_the_hint_bar(self):
+        assert not parse_btw_panel(SHORT).present  # hence: make room first
 
     def test_copied_hint_still_counts_as_settled(self):
         st = parse_btw_panel(SETTLED.replace("c to copy", "Copied to clipboard"))
@@ -163,3 +195,48 @@ async def test_second_question_on_same_window_is_rejected():
     finally:
         side_question._active_windows.discard("@9")
     assert not ok and "already in progress" in answer
+
+
+async def test_a_small_window_is_enlarged_while_the_question_runs():
+    patches = _patches(captures=[SETTLED], buffers=["buffer1", "buffer2"])
+    sizes = {"#{window_width} #{window_height}": "60 12\n"}
+
+    async def tmux(*args: str) -> str:
+        return sizes.get(args[-1], "full **md**\n")
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patch.object(side_question, "_tmux", AsyncMock(side_effect=tmux)) as calls,
+    ):
+        ok, _ = await run_side_question("@1", "q", timeout=30)
+
+    assert ok
+    called = [c.args for c in calls.await_args_list]
+    enlarge = ("resize-window", "-t", "@1", "-x", "100", "-y", "30")
+    restore = ("resize-window", "-t", "@1", "-x", "60", "-y", "12")
+    assert called.index(enlarge) < called.index(restore)  # put back afterwards
+    assert called[-1] == ("set-option", "-w", "-u", "-t", "@1", "window-size")
+
+
+async def test_a_large_window_is_left_alone():
+    patches = _patches(captures=[SETTLED], buffers=["buffer1", "buffer2"])
+
+    async def tmux(*args: str) -> str:
+        return "173 40\n" if args[0] == "display-message" else "full **md**\n"
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patch.object(side_question, "_tmux", AsyncMock(side_effect=tmux)) as calls,
+    ):
+        await run_side_question("@1", "q", timeout=30)
+    assert all(c.args[0] != "resize-window" for c in calls.await_args_list)
