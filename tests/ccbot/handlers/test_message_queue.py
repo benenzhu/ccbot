@@ -4,20 +4,22 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiolimiter import AsyncLimiter
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 from ccbot.handlers import message_queue, message_sender
 from ccbot.handlers.message_queue import MessageTask, _process_voice_task
 from ccbot.monitor_state import DeliveryTicket
+from ccbot.rate_limit import TelegramRateLimiter
 from ccbot.tts import TtsApiError
 
 
 @pytest.fixture(autouse=True)
 def _fresh_chat_pacing():
-    """Every test starts with all per-chat send slots free."""
+    """Every test starts with all per-chat send slots free and no turn begun."""
     message_queue._chat_next_send.clear()
+    message_queue._turn_has_output.clear()
     yield
+    message_queue._turn_has_output.clear()
     message_queue._chat_next_send.clear()
 
 
@@ -307,7 +309,7 @@ async def test_table_task_breaks_content_merge():
     assert queue.get_nowait() is after
 
 
-async def test_table_task_sends_table_then_checks_status():
+async def test_table_task_sends_table_and_counts_as_turn_output():
     bot = AsyncMock()
     task = MessageTask(
         task_type="table", window_id="@1", thread_id=42, tables=[(["h"], [["v"]])]
@@ -317,12 +319,12 @@ async def test_table_task_sends_table_then_checks_status():
             message_queue.session_manager, "resolve_chat_id", return_value=777
         ),
         patch.object(message_queue, "_send_task_tables", AsyncMock()) as send,
-        patch.object(message_queue, "_check_and_send_status", AsyncMock()) as status,
+        patch.object(message_queue, "_turn_has_output", set()) as turns,
     ):
         await message_queue._process_table_task(bot, 5, task)
 
     send.assert_awaited_once_with(bot, 777, task)
-    status.assert_awaited_once_with(bot, 5, "@1", 42)
+    assert turns == {(5, 42)}
 
 
 async def test_enqueue_table_message_creates_table_task():
@@ -357,7 +359,7 @@ def _content_patches(send: AsyncMock):
             message_queue.session_manager, "resolve_chat_id", return_value=777
         ),
         patch.object(message_queue, "send_with_fallback", send),
-        patch.object(message_queue, "_check_and_send_status", AsyncMock()),
+        patch.object(message_queue, "_turn_has_output", set()),
         patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock),
     )
 
@@ -459,21 +461,19 @@ async def test_attachments_are_not_resent_on_retry():
         image_data=[("image/png", b"png")],
     )
     send = AsyncMock(return_value=AsyncMock(message_id=1))
-    status = AsyncMock(side_effect=[RetryAfter(2), None])
+    photo = AsyncMock(side_effect=[RetryAfter(2), None])
     with (
         patch.object(
             message_queue.session_manager, "resolve_chat_id", return_value=777
         ),
         patch.object(message_queue, "send_with_fallback", send),
-        patch.object(message_queue, "send_photo", AsyncMock()) as photo,
-        patch.object(message_queue, "_check_and_send_status", status),
+        patch.object(message_queue, "send_photo", photo),
         patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock),
     ):
         await message_queue._deliver_task(bot, 5, task)
 
-    send.assert_awaited_once()
-    photo.assert_awaited_once()
-    assert status.await_count == 2
+    send.assert_awaited_once()  # the text went out before the flood ban
+    assert photo.await_count == 2
 
 
 async def test_upload_that_keeps_timing_out_is_given_up():
@@ -491,7 +491,6 @@ async def test_upload_that_keeps_timing_out_is_given_up():
         patch.object(
             message_queue, "send_photo", AsyncMock(side_effect=TimedOut())
         ) as photo,
-        patch.object(message_queue, "_check_and_send_status", AsyncMock()),
         patch.object(message_queue.asyncio, "sleep", new_callable=AsyncMock),
     ):
         await message_queue._deliver_task(bot, 5, task)
@@ -676,7 +675,7 @@ def _clean_status_state():
     """Start and end with no status message, tool message or gone topic tracked."""
     for state in (
         message_queue._status_msg_info,
-        message_queue._status_shown_at,
+        message_queue._turn_has_output,
         message_queue._tool_msg_ids,
         message_sender._gone_topics,
     ):
@@ -684,7 +683,7 @@ def _clean_status_state():
     yield
     for state in (
         message_queue._status_msg_info,
-        message_queue._status_shown_at,
+        message_queue._turn_has_output,
         message_queue._tool_msg_ids,
         message_sender._gone_topics,
     ):
@@ -769,36 +768,32 @@ async def test_worker_sends_backlogged_tool_call_once_instead_of_send_plus_edit(
 # --- Status is optional traffic: it yields to everything else ---
 
 
-@pytest.mark.usefixtures("_clean_status_state")
-def test_status_counters_only_change_is_refreshed_at_most_every_interval():
-    skey = (5, 42)
-    with patch.object(message_queue.time, "monotonic", return_value=1000.0) as now:
-        message_queue._remember_status(skey, 9, "@1", "Roosting… (12s · ↓ 1.2k)")
+@pytest.mark.parametrize(
+    "line, label",
+    [
+        pytest.param("Zesting… (2m 24s · ↓ 11.7k tokens)", "Zesting…", id="counters"),
+        pytest.param("Zesting… (9s · ↓ 640 tok", "Zesting…", id="cut_off"),
+        pytest.param("Brewed for 3m 14s · done 12:34 AM", None, id="no_details"),
+    ],
+)
+def test_status_message_drops_details_that_would_go_stale(line: str, label: str | None):
+    assert message_queue._status_label(line) == (label or line)
 
-        now.return_value = 1005.0
-        assert message_queue._status_is_current(skey, "@1", "Roosting… (17s · ↓ 1.5k)")
-        assert not message_queue._status_is_current(
-            skey, "@1", "Pondering… (17s · ↓ 1.5k)"
-        )  # a real change shows right away
-        assert not message_queue._status_is_current(
-            skey, "@2", "Roosting… (12s · ↓ 1.2k)"
-        )
 
-        now.return_value = 1000.0 + message_queue.STATUS_COUNTER_REFRESH
-        assert not message_queue._status_is_current(
-            skey, "@1", "Roosting… (42s · ↓ 3.0k)"
-        )
+async def _limiter_with_free(free: int) -> TelegramRateLimiter:
+    limiter = TelegramRateLimiter()
+    for _ in range(limiter.window.max_requests - free):
+        await limiter.window.acquire()
+    return limiter
 
 
 @pytest.mark.usefixtures("_clean_status_state")
-async def test_status_waits_until_the_global_limiter_is_idle():
+async def test_status_leaves_the_last_window_slots_to_content():
     task = MessageTask(
         task_type="status_update", window_id="@1", text="Working…", thread_id=42
     )
-    busy = AsyncLimiter(1, 2.2)
-    await busy.acquire()  # a request just went out
     bot = AsyncMock()
-    bot.rate_limiter = MagicMock(_base_limiter=busy)
+    bot.rate_limiter = await _limiter_with_free(message_queue.STATUS_RESERVE)
     with (
         patch.object(
             message_queue.session_manager, "resolve_chat_id", return_value=777
@@ -808,26 +803,77 @@ async def test_status_waits_until_the_global_limiter_is_idle():
         await message_queue._process_status_update_task(bot, 5, task)
         send.assert_not_awaited()
 
-        bot.rate_limiter = MagicMock(_base_limiter=AsyncLimiter(1, 2.2))
+        bot.rate_limiter = await _limiter_with_free(message_queue.STATUS_RESERVE + 1)
         await message_queue._process_status_update_task(bot, 5, task)
         send.assert_awaited_once()
 
 
 @pytest.mark.usefixtures("_clean_status_state")
-async def test_status_edit_sends_no_typing_action():
+async def test_status_is_sent_once_and_never_edited():
     bot = AsyncMock()
-    message_queue._remember_status((5, 42), 9, "@1", "Reading a.py")
-    task = MessageTask(
-        task_type="status_update", window_id="@1", text="Writing b.py", thread_id=42
-    )
+    bot.send_message.return_value = MagicMock(message_id=9)
+
+    def task(text: str) -> MessageTask:
+        return MessageTask(
+            task_type="status_update", window_id="@1", text=text, thread_id=42
+        )
+
     with patch.object(
         message_queue.session_manager, "resolve_chat_id", return_value=777
     ):
-        await message_queue._process_status_update_task(bot, 5, task)
+        await message_queue._process_status_update_task(
+            bot, 5, task("Zesting… (3s · thinking with high effort)")
+        )
+        await message_queue._process_status_update_task(
+            bot, 5, task("Zesting… (40s · ↓ 2.1k tokens · still thinking)")
+        )
 
-    bot.edit_message_text.assert_awaited_once()
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs["text"].strip() == "Zesting…"
+    bot.edit_message_text.assert_not_awaited()
     bot.send_chat_action.assert_not_awaited()
-    assert message_queue._status_msg_info[(5, 42)] == (9, "@1", "Writing b.py")
+    assert message_queue._status_msg_info[(5, 42)] == (9, "@1", "Zesting…")
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_no_status_once_the_turn_has_output_until_the_next_turn():
+    bot = AsyncMock()
+    bot.send_message.return_value = MagicMock(message_id=9)
+    status = MessageTask(
+        task_type="status_update", window_id="@1", text="Zesting…", thread_id=42
+    )
+    with (
+        patch.object(
+            message_queue.session_manager, "resolve_chat_id", return_value=777
+        ),
+        patch.object(message_queue, "_pace", AsyncMock()),
+    ):
+        content = MessageTask(
+            task_type="content", window_id="@1", parts=["Bash(ls)"], thread_id=42
+        )
+        await message_queue._process_content_task(bot, 5, content)
+        await message_queue._process_status_update_task(bot, 5, status)
+        bot.send_message.assert_awaited_once()  # the content, no status after it
+
+        message_queue.end_turn(5, 42)  # poller saw Claude idle
+        await message_queue._process_status_update_task(bot, 5, status)
+        assert bot.send_message.await_count == 2
+
+
+async def test_status_is_off_unless_enabled():
+    with (
+        patch.object(message_queue.config, "show_status", False),
+        patch.object(message_queue, "get_or_create_queue") as queue,
+    ):
+        await message_queue.enqueue_status_update(AsyncMock(), 5, "@1", "Zesting…", 42)
+    queue.assert_not_called()
+
+
+async def test_user_message_starts_a_new_turn():
+    message_queue._turn_has_output.add((5, 42))
+    with patch.object(message_queue, "get_or_create_queue"):
+        await message_queue.enqueue_status_update(AsyncMock(), 5, "@1", None, 42)
+    assert (5, 42) not in message_queue._turn_has_output
 
 
 @pytest.mark.usefixtures("_clean_status_state")
@@ -841,7 +887,6 @@ async def test_tool_result_edit_leaves_the_status_message_in_place():
             message_queue.session_manager, "resolve_chat_id", return_value=777
         ),
         patch.object(message_queue, "_pace", AsyncMock()),
-        patch.object(message_queue.tmux_manager, "find_window_by_id", AsyncMock()),
     ):
         await message_queue._process_content_task(bot, 5, task)
 
@@ -863,7 +908,6 @@ async def test_attachments_after_tool_result_edit_do_not_land_below_status():
         ),
         patch.object(message_queue, "_pace", AsyncMock()),
         patch.object(message_queue, "send_photo", AsyncMock()) as photo,
-        patch.object(message_queue, "_check_and_send_status", AsyncMock()),
     ):
         await message_queue._process_content_task(bot, 5, task)
 

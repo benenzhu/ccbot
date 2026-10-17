@@ -26,6 +26,7 @@ SENSITIVE_ENV_VARS = {
     "AZURE_SPEECH_KEY",
     "VOLCANO_TTS_ACCESS_KEY",
     "VOLCANO_TTS_API_KEY",
+    "CCBOT_ALERT_WEBHOOK",
 }
 
 
@@ -103,6 +104,21 @@ class Config:
             os.getenv("CCBOT_SHOW_TOOL_CALLS", "true").lower() != "false"
         )
 
+        # Send Claude's thinking blocks ("∴ Thinking…") to Telegram. Off by
+        # default: the replies and tool calls say enough. Narration (progress
+        # updates that arrive as thinking blocks) is always sent.
+        self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "").lower() == "true"
+
+        # Send a status message ("Zesting…") when Claude starts working. Off by
+        # default: the 👤 echo of the user's message shows the turn started.
+        self.show_status = os.getenv("CCBOT_SHOW_STATUS", "").lower() == "true"
+
+        # Send each subagent Claude starts to a read-only topic of its own
+        # (sub-<parent>-<task>), tool calls included
+        self.subagent_topics = (
+            os.getenv("CCBOT_SUBAGENT_TOPICS", "true").lower() != "false"
+        )
+
         # Compact history replay (resume with replay): drop thinking and tool
         # call messages, leaving one divider line per run of dropped blocks.
         # When False, the replay sends the full transcript.
@@ -122,6 +138,9 @@ class Config:
 
         # How long /btw waits for Claude Code's side-question panel to settle.
         self.btw_timeout = float(os.getenv("CCBOT_BTW_TIMEOUT", "120"))
+
+        # WeCom group-bot webhook URL; told when flood control stops ccbot
+        self.alert_webhook_url: str = os.getenv("CCBOT_ALERT_WEBHOOK", "")
 
         # OpenAI API for voice message transcription (optional)
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")

@@ -9,11 +9,15 @@ has not reached Telegram yet. Each message read from a transcript holds a
 DeliveryTicket until it is sent, so a restart re-reads (and re-sends)
 whatever was still queued instead of losing it.
 
+Subagent transcripts are tracked the same way, keyed "agent-<id>" and tied
+to their parent session.
+
 Key classes: MonitorState, TrackedSession, DeliveryTicket.
 """
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +66,13 @@ class TrackedSession:
     # history, which must still count as replay (compact, no TTS).
     replaying: bool = False
     replay_until: int = 0
+    # A subagent's transcript is tracked like a session, under the key
+    # "agent-<id>"; parent_session_id names the session that started it.
+    parent_session_id: str = ""
+    # Epoch seconds since when this session's subagents are read from their
+    # first line; those started earlier only from where they were when first
+    # seen (what they write after that still shows).
+    subagents_since: float = field(default_factory=time.time)
 
     def is_replay(self, line_offset: int) -> bool:
         """True if the JSONL line at `line_offset` is replayed history."""
@@ -84,6 +95,8 @@ class TrackedSession:
             "last_byte_offset": self.resume_offset,
             "replaying": self.replaying,
             "replay_until": self.replay_until,
+            "parent_session_id": self.parent_session_id,
+            "subagents_since": self.subagents_since,
         }
 
     @classmethod
@@ -95,6 +108,9 @@ class TrackedSession:
             last_byte_offset=data.get("last_byte_offset", 0),
             replaying=data.get("replaying", False),
             replay_until=data.get("replay_until", 0),
+            parent_session_id=data.get("parent_session_id", ""),
+            # Older files: subagents started from now on are read in full
+            subagents_since=data.get("subagents_since") or time.time(),
         )
 
 

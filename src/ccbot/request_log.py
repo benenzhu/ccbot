@@ -1,17 +1,17 @@
 """Per-request Telegram API log — one line for every Bot API call that goes out.
 
-The bot-wide rate limit (one request per 2.2s) is shared by content, status
-edits, deletes and command replies alike; this log shows where the quota goes.
+Content, status edits, deletes and command replies all share the bot-wide
+rate limit (rate_limit.py); this log shows where the quota goes.
 
 Key components:
-  - LoggingRateLimiter: AIORateLimiter subclass that logs each request after
-    it finishes: method, chat, topic, message id, the time spent waiting for
-    a rate-limit slot, the time Telegram took, and a preview of the text.
-    Requests carrying Claude output also log lag: seconds from the bot
-    reading the entry from the JSONL to Telegram accepting the request — the
-    bot's own delay (queue, rate limit, sending), not Claude's: Claude Code
-    can write an entry well after its timestamp (a thinking block waits for
-    the tool call after it). getUpdates bypasses the rate limiter, unlogged.
+  - log_request: called by the rate limiter once a request finishes; logs the
+    method, chat, topic, message id, the time spent waiting for a rate-limit
+    slot, the time Telegram took, and a preview of the text. Requests
+    carrying Claude output also log lag: seconds from the bot reading the
+    entry from the JSONL to Telegram accepting the request — the bot's own
+    delay (queue, rate limit, sending), not Claude's: Claude Code can write
+    an entry well after its timestamp (a thinking block waits for the tool
+    call after it). getUpdates bypasses the rate limiter, unlogged.
   - request_purpose: context manager labelling the requests made inside it
     (e.g. "status", "tool_use") and when the bot read their source; the
     queue worker sets it per task.
@@ -22,12 +22,10 @@ scripts/api_log.py turns these lines into a readable timeline.
 import json
 import logging
 import time
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
-
-from telegram.ext import AIORateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -97,42 +95,13 @@ def _format_line(
     return " ".join(fields)
 
 
-class LoggingRateLimiter(AIORateLimiter):
-    """AIORateLimiter that logs every request it lets through."""
-
-    async def process_request(
-        self,
-        callback: Callable[..., Coroutine[Any, Any, bool | dict[str, Any] | list]],
-        args: Any,
-        kwargs: dict[str, Any],
-        endpoint: str,
-        data: dict[str, Any],
-        rate_limit_args: int | None,
-    ) -> bool | dict[str, Any] | list:
-        queued = time.monotonic()
-        started: float | None = None
-
-        async def timed(*a: Any, **kw: Any) -> bool | dict[str, Any] | list:
-            nonlocal started
-            if started is None:  # AIORateLimiter retries after a flood ban
-                started = time.monotonic()
-            return await callback(*a, **kw)
-
-        result: Any = None
-        error: BaseException | None = None
-        try:
-            result = await super().process_request(
-                timed, args, kwargs, endpoint, data, rate_limit_args
-            )
-            return result
-        except BaseException as e:
-            error = e
-            raise
-        finally:
-            done = time.monotonic()
-            begin = started if started is not None else done
-            logger.info(
-                _format_line(
-                    endpoint, data, result, begin - queued, done - begin, error
-                )
-            )
+def log_request(
+    endpoint: str,
+    data: dict[str, Any],
+    result: Any,
+    wait: float,
+    took: float,
+    error: BaseException | None,
+) -> None:
+    """Log one finished request (wait: for a rate-limit slot; took: Telegram)."""
+    logger.info(_format_line(endpoint, data, result, wait, took, error))

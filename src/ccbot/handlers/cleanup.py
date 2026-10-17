@@ -13,6 +13,7 @@ from telegram import Bot
 
 from .interactive_ui import clear_interactive_msg
 from .message_queue import clear_status_msg_info, clear_tool_msg_ids_for_topic
+from .topic_light import forget_topic_light
 
 
 async def clear_topic_state(
@@ -38,6 +39,9 @@ async def clear_topic_state(
 
     # Clear tool message ID tracking
     clear_tool_msg_ids_for_topic(user_id, thread_id)
+
+    # The topic no longer has a window whose state its light shows
+    forget_topic_light(user_id, thread_id)
 
     # Clear interactive UI state (also deletes message from chat)
     await clear_interactive_msg(user_id, bot, thread_id)

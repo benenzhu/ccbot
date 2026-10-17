@@ -58,6 +58,23 @@ class TestConvertMarkdown:
         assert "after" in result
 
 
+class TestTablesInConvertMarkdown:
+    TABLE = "| op | ms |\n|---|---|\n| gemm | 1.5 |"
+
+    def test_table_outside_quotes_becomes_cards(self) -> None:
+        result = convert_markdown(f"intro\n{self.TABLE}")
+        assert "*op*: gemm" in result
+        assert "\\| op \\|" not in result
+
+    def test_table_inside_quote_stays_as_written(self) -> None:
+        """Tool output shows verbatim: no cards with literal ** markers."""
+        result = convert_markdown(
+            f"*Bash*(cat README)\n{EXP_START}{self.TABLE}{EXP_END}"
+        )
+        assert ">\\| op \\| ms \\|\n>\\|\\-\\-\\-\\|" in result
+        assert "\\*\\*op" not in result
+
+
 class TestTableToMarkdown:
     """table_to_markdown serializes (headers, rows) back to pipe syntax."""
 

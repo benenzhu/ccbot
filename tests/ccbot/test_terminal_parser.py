@@ -49,6 +49,39 @@ class TestParseStatusLine:
         pane = f"output\n✻ Doing work\n\n{chrome}"
         assert parse_status_line(pane) == "Doing work"
 
+    def test_status_above_its_tip_and_todo_lines(self, chrome: str):
+        pane = (
+            "● Bash(ls)\n  ⎿  Running…\n\n"
+            "✽ Zesting… (2m 24s · ↓ 11.7k tokens)\n"
+            "  ⎿  Tip: Run /install-slack-app to use Claude in Slack\n"
+            "     ☐ Fix the parser\n"
+            f"\n{chrome}"
+        )
+        assert parse_status_line(pane) == "Zesting… (2m 24s · ↓ 11.7k tokens)"
+
+    def test_separator_named_by_rename(self):
+        """After /rename the separator above the prompt carries the name."""
+        rule = "─" * 60
+        pane = f"output\n✻ Doing work\n\n{rule} ccbot dev ─\n❯ \n{rule}\n  status bar\n"
+        assert parse_status_line(pane) == "Doing work"
+        assert strip_pane_chrome(pane.split("\n")) == ["output", "✻ Doing work", ""]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "✻ Brewed for 3m 14s · done 12:34 AM",
+            "✻ Worked for 14m 8s · done 8:48 AM · 1 shell still running",
+            "✻ Cooked for 9s",
+        ],
+    )
+    def test_finished_turn_is_no_status(self, line: str, chrome: str):
+        assert parse_status_line(f"● Done.\n\n{line}\n\n{chrome}") is None
+
+    def test_idle_tool_output_is_no_status(self, chrome: str):
+        """Indented output under a finished tool call isn't skipped into."""
+        pane = f"✻ Brewed for 3s\n● Bash(ls)\n  ⎿  a.py\n     b.py\n{chrome}"
+        assert parse_status_line(pane) is None
+
     def test_idle_no_status(self, chrome: str):
         """Idle pane (no status line above chrome) returns None."""
         pane = f"some output\n● Tool result\n{chrome}"

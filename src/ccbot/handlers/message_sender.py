@@ -14,7 +14,7 @@ Functions:
   - safe_send: Send message with formatting, fallback to plain text
   - is_topic_gone: Topics a send found deleted (Telegram sends no update)
 
-Rate limiting is handled globally by AIORateLimiter on the Application.
+Rate limiting is handled globally by TelegramRateLimiter on the Application.
 Transient failures (RetryAfter, timeouts, network errors — see
 is_transient_error) are re-raised from the queue-facing paths
 (send_with_fallback(raise_transient=True), send_photo, send_rich_markdown) so
@@ -155,7 +155,7 @@ async def send_photo(
 ) -> None:
     """Send photo(s) to chat. Sends as media group if multiple images.
 
-    Rate limiting is handled globally by AIORateLimiter on the Application.
+    Rate limiting is handled globally by TelegramRateLimiter on the Application.
 
     Args:
         bot: Telegram Bot instance

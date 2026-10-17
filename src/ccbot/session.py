@@ -41,6 +41,17 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class DeadBinding:
+    """A topic whose window died (tmux server gone) but whose session can resume."""
+
+    user_id: int
+    thread_id: int
+    window_name: str
+    session_id: str
+    cwd: str
+
+
+@dataclass
 class WindowState:
     """Persistent state for a tmux window.
 
@@ -195,14 +206,17 @@ class SessionManager:
                 self.window_display_names = {}
                 self.group_chat_ids = {}
 
-    async def resolve_stale_ids(self) -> None:
+    async def resolve_stale_ids(self) -> list[DeadBinding]:
         """Re-resolve persisted window IDs against live tmux windows.
 
         Called on startup. Handles two cases:
         1. Old-format migration: window_name keys → window_id keys
         2. Stale IDs: window_id no longer exists but display name matches a live window
 
-        Builds {window_name: window_id} from live windows, then remaps or drops entries.
+        Builds {window_name: window_id} from live windows, then remaps or drops
+        entries. A dropped topic binding whose window knew its session is
+        returned, so the caller can resume that session in a new window (the
+        tmux server died — after a reboot or logout — but the transcript didn't).
         """
         windows = await tmux_manager.list_windows()
         live_by_name: dict[str, str] = {}  # window_name -> window_id
@@ -212,6 +226,10 @@ class SessionManager:
             live_ids.add(w.window_id)
 
         changed = False
+        # Snapshots: the window_states pass below re-keys display names
+        old_window_states = dict(self.window_states)
+        old_display_names = dict(self.window_display_names)
+        dead: list[DeadBinding] = []
 
         # --- Migrate window_states ---
         new_window_states: dict[str, WindowState] = {}
@@ -264,7 +282,7 @@ class SessionManager:
                     if val in live_ids:
                         new_bindings[tid] = val
                     else:
-                        display = self.window_display_names.get(val, val)
+                        display = old_display_names.get(val, val)
                         new_id = live_by_name.get(display)
                         if new_id:
                             logger.info(
@@ -284,6 +302,13 @@ class SessionManager:
                                 val,
                             )
                             changed = True
+                            ws = old_window_states.get(val)
+                            if ws and ws.session_id and ws.cwd:
+                                dead.append(
+                                    DeadBinding(
+                                        uid, tid, display, ws.session_id, ws.cwd
+                                    )
+                                )
                 else:
                     # Old format: val is window_name
                     new_id = live_by_name.get(val)
@@ -315,7 +340,7 @@ class SessionManager:
                     if key in live_ids:
                         new_offsets[key] = offset
                     else:
-                        display = self.window_display_names.get(key, key)
+                        display = old_display_names.get(key, key)
                         new_id = live_by_name.get(display)
                         if new_id:
                             new_offsets[new_id] = offset
@@ -331,6 +356,24 @@ class SessionManager:
                         changed = True
             self.user_window_offsets[uid] = new_offsets
 
+        # Bound windows' display names follow their live tmux names, which
+        # ccbot sets on every rename (an old session_map sync reverted
+        # display names to the name a window had at SessionStart)
+        bound = {wid for b in self.thread_bindings.values() for wid in b.values()}
+        for w in windows:
+            display = self.window_display_names.get(w.window_id)
+            if w.window_id in bound and display not in (None, w.window_name):
+                logger.info(
+                    "Display name of %s follows its window: '%s' -> '%s'",
+                    w.window_id,
+                    display,
+                    w.window_name,
+                )
+                self.window_display_names[w.window_id] = w.window_name
+                if w.window_id in self.window_states:
+                    self.window_states[w.window_id].window_name = w.window_name
+                changed = True
+
         if changed:
             self._save_state()
             logger.info("Startup re-resolution complete")
@@ -338,6 +381,7 @@ class SessionManager:
         # Clean up session_map.json: stale window IDs and old-format keys
         await self._cleanup_stale_session_map_entries(live_ids)
         await self._cleanup_old_format_session_map_keys()
+        return dead
 
     async def _cleanup_old_format_session_map_keys(self) -> None:
         """Remove old-format keys (window_name instead of @window_id) from session_map.json."""
@@ -506,7 +550,9 @@ class SessionManager:
         Keys in session_map are formatted as "tmux_session:window_id" (e.g. "ccbot:@12").
         Only entries matching our tmux_session_name are processed.
         Also cleans up window_states entries not in current session_map.
-        Updates window_display_names from the "window_name" field in values.
+        A window without a display name takes the "window_name" the hook saw;
+        an existing one is kept — the hook's name is from SessionStart, and
+        the window may have been renamed since (/rename, topic rename).
         """
         if not config.session_map_file.exists():
             return
@@ -545,12 +591,11 @@ class SessionManager:
                 state.session_id = new_sid
                 state.cwd = new_cwd
                 changed = True
-            # Update display name
-            if new_wname:
+            # Name a window we have no name for yet
+            if new_wname and window_id not in self.window_display_names:
                 state.window_name = new_wname
-                if self.window_display_names.get(window_id) != new_wname:
-                    self.window_display_names[window_id] = new_wname
-                    changed = True
+                self.window_display_names[window_id] = new_wname
+                changed = True
 
         # Clean up window_states entries not in current session_map.
         stale_wids = [w for w in self.window_states if w and w not in valid_wids]

@@ -17,6 +17,8 @@ Core responsibilities:
   - Automatic cleanup: closing a topic kills the associated window
     (topic_closed_handler). Unsupported content (stickers, etc.)
     is rejected with a warning (unsupported_content_handler).
+  - Subagent topics: a subagent's messages go to a topic of its own
+    (handlers/subagent_topics.py); messages sent there are refused.
   - Bot lifecycle management: post_init, post_shutdown, create_bot.
 
 Handler modules (in handlers/):
@@ -28,6 +30,7 @@ Handler modules (in handlers/):
   - interactive_ui: Interactive UI handling
   - status_polling: Terminal status polling
   - response_builder: Response message building
+  - subagent_topics: A read-only topic per subagent
 
 Key functions: create_bot(), handle_new_message(), handle_session_renamed().
 """
@@ -45,6 +48,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    Message,
     Update,
 )
 from telegram.constants import ChatAction, ForumTopicLimit
@@ -137,6 +141,14 @@ from .handlers.message_sender import (
 from .handlers.response_builder import build_response_parts
 from .handlers.side_question import run_side_question
 from .handlers.status_polling import status_poll_loop
+from .handlers.subagent_topics import subagent_topic, topics_for_message
+from .handlers.topic_light import (
+    forget_topic_light,
+    note_topic_name,
+    shown_state,
+    strip_light,
+    topic_name,
+)
 from .markdown_v2 import (
     ParsedTable,
     convert_markdown,
@@ -144,9 +156,9 @@ from .markdown_v2 import (
     split_text_by_tables,
 )
 from .monitor_state import TrackedSession
-from .request_log import LoggingRateLimiter
+from .rate_limit import TelegramRateLimiter
 from .screenshot import text_to_image
-from .session import session_manager
+from .session import DeadBinding, session_manager
 from .session_monitor import NewMessage, SessionMonitor
 from .terminal_parser import extract_bash_output, is_interactive_ui
 from .tmux_manager import tmux_manager
@@ -162,6 +174,9 @@ session_monitor: SessionMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
+
+# Resumes topics whose windows died with the tmux server (startup only)
+_revive_task: asyncio.Task | None = None
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -193,6 +208,24 @@ def _get_thread_id(update: Update) -> int | None:
 
 
 # --- Command handlers ---
+
+
+# A subagent's topic only shows what the subagent does
+SUBAGENT_TOPIC_REPLY = (
+    "🤖 This topic shows a subagent of “{parent}”; it can't take messages. "
+    "Write in “{parent}” instead."
+)
+
+
+async def _refuse_in_subagent_topic(
+    message: Message, user_id: int, thread_id: int | None
+) -> bool:
+    """Answer a message sent to a subagent's topic; True if it was one."""
+    sub = subagent_topic(user_id, thread_id)
+    if sub is None:
+        return False
+    await safe_reply(message, SUBAGENT_TOPIC_REPLY.format(parent=sub.parent_name))
+    return True
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -519,6 +552,12 @@ async def topic_edited_handler(
     if thread_id is None:
         return
 
+    # The status light is the bot's, not part of the window name
+    clean_name = strip_light(new_name)
+    if clean_name == new_name:
+        forget_topic_light(user.id, thread_id)
+    new_name = clean_name
+
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if not wid:
         logger.debug(
@@ -560,12 +599,14 @@ async def handle_session_renamed(session_id: str, title: str, bot: Bot) -> None:
             logger.info(
                 "Session renamed: '%s' -> '%s' (window=%s)", old_name, name, wid
             )
+        topic = topic_name(name, shown_state(user_id, thread_id))
         try:
             await bot.edit_forum_topic(
                 chat_id=session_manager.resolve_chat_id(user_id, thread_id),
                 message_thread_id=thread_id,
-                name=name,
+                name=topic,
             )
+            note_topic_name(user_id, thread_id, topic)
         except Exception as e:
             logger.debug(f"Failed to rename topic {thread_id}: {e}")
 
@@ -701,6 +742,9 @@ async def forward_command_handler(
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, thread_id, chat.id)
 
+    if await _refuse_in_subagent_topic(update.message, user.id, thread_id):
+        return
+
     cmd_text = update.message.text or ""
     # The full text is already a slash command like "/clear" or "/compact foo"
     cc_slash = cmd_text.split("@")[0]  # strip bot mention
@@ -783,6 +827,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    if await _refuse_in_subagent_topic(update.message, user.id, thread_id):
+        return
+
     wid = session_manager.get_window_for_thread(user.id, thread_id)
     if wid is None:
         await safe_reply(
@@ -859,6 +906,9 @@ async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             update.message,
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
+        return
+
+    if await _refuse_in_subagent_topic(update.message, user.id, thread_id):
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
@@ -1076,6 +1126,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             update.message,
             "❌ Please use a named topic. Create a new topic to start a session.",
         )
+        return
+
+    if await _refuse_in_subagent_topic(update.message, user.id, thread_id):
         return
 
     wid = session_manager.get_window_for_thread(user.id, thread_id)
@@ -1404,6 +1457,7 @@ async def _create_and_bind_window(
                     message_thread_id=pending_thread_id,
                     name=created_wname,
                 )
+                forget_topic_light(user.id, pending_thread_id)
             except Exception as e:
                 logger.debug(f"Failed to rename topic: {e}")
 
@@ -2170,8 +2224,12 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         f"text_len={len(msg.text)}"
     )
 
-    # Find users whose thread-bound window matches this session
-    active_users = await session_manager.find_users_for_session(msg.session_id)
+    # Find users whose thread-bound window matches this session; a
+    # subagent's message goes to the subagent's own topic instead
+    if msg.agent_id:
+        active_users = await topics_for_message(bot, msg)
+    else:
+        active_users = await session_manager.find_users_for_session(msg.session_id)
 
     if not active_users:
         logger.info(f"No active users for session {msg.session_id}")
@@ -2186,6 +2244,7 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     speak = (
         config.tts_enabled
         and not msg.is_replay
+        and not msg.agent_id
         and msg.role == "assistant"
         and msg.content_type == "text"
         and bool(msg.text)
@@ -2193,7 +2252,11 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
     for user_id, wid, thread_id in active_users:
         # Handle interactive tools specially - capture terminal and send UI
-        if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
+        if (
+            msg.tool_name in INTERACTIVE_TOOL_NAMES
+            and msg.content_type == "tool_use"
+            and not msg.agent_id
+        ):
             # Mark interactive mode BEFORE sleeping so polling skips this window
             set_interactive_mode(user_id, wid, thread_id)
             # Flush pending messages (e.g. plan content) before sending interactive UI
@@ -2233,13 +2296,19 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         # Markdown tables become native Telegram tables (Bot API 10.1, PNG
         # fallback). Assistant prose is split at each table so the table stays
         # where it was written: prose → table → prose, each its own message.
-        # Other content (tool_result edits an earlier message, so it can't be
-        # split) keeps tables trailing after the text. Only complete messages
-        # get this treatment — partial streams may have unfinished syntax.
+        # Other content keeps tables trailing after the text. Tool calls and
+        # thinking keep theirs inline, in the collapsed quote — a message per
+        # table isn't worth its request there. Only complete messages get this
+        # treatment — partial streams may have unfinished syntax.
         text_for_parts = msg.text
         tables: list[ParsedTable] = []
         segments: list[str | ParsedTable] = []
-        if msg.is_complete and msg.content_type != "thinking":
+        if msg.is_complete and msg.content_type not in (
+            "notification",
+            "thinking",
+            "tool_use",
+            "tool_result",
+        ):
             if msg.content_type == "text" and msg.role == "assistant":
                 segments = split_text_by_tables(msg.text)
                 if not any(isinstance(seg, tuple) for seg in segments):
@@ -2306,7 +2375,9 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
             # Update user's read offset to current file position
             # This marks these messages as "read" for this user
-            session_file = session_manager.session_file_for_window(wid)
+            session_file = (
+                None if msg.agent_id else session_manager.session_file_for_window(wid)
+            )
             if session_file:
                 try:
                     file_size = session_file.stat().st_size
@@ -2318,8 +2389,51 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 # --- App lifecycle ---
 
 
+async def _revive_topics(dead: list[DeadBinding]) -> None:
+    """Resume each dead topic's session in a new window and bind it there.
+
+    The tmux server died (reboot, logout) and took every window along, but
+    the transcripts survive: `claude --resume` in the same cwd picks the
+    conversation up, without replaying it to Telegram. All windows are created
+    and bound first, so the topics work right away; the SessionStart hooks
+    are then awaited together.
+    """
+    started: list[tuple[str, str | None]] = []
+    for d in dead:
+        file_path = session_manager._locate_session_file(d.session_id, d.cwd)
+        if file_path is None:
+            logger.warning(
+                "Not resuming topic %d: transcript of %s not found",
+                d.thread_id,
+                d.session_id,
+            )
+            continue
+        success, message, _, wid, target_sid = await _launch_session_window(
+            d.cwd, resume_session_id=d.session_id, resume_file_path=str(file_path)
+        )
+        if not success:
+            logger.warning("Not resuming topic %d: %s", d.thread_id, message)
+            continue
+        await tmux_manager.rename_window(wid, d.window_name)
+        session_manager.get_window_state(wid).window_name = d.window_name
+        session_manager.bind_thread(
+            d.user_id, d.thread_id, wid, window_name=d.window_name
+        )
+        logger.info(
+            "Resumed topic %d (%s) in %s: session %s",
+            d.thread_id,
+            d.window_name,
+            wid,
+            d.session_id,
+        )
+        started.append((wid, target_sid))
+    await asyncio.gather(
+        *(_await_session_start(wid, sid, resumed=True) for wid, sid in started)
+    )
+
+
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task
+    global session_monitor, _status_poll_task, _revive_task
 
     await application.bot.delete_my_commands()
 
@@ -2341,18 +2455,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(bot_commands)
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
-    await session_manager.resolve_stale_ids()
-
-    # Pre-fill global rate limiter bucket on restart.
-    # AsyncLimiter starts at _level=0 (full burst capacity), but Telegram's
-    # server-side counter persists across bot restarts.  Setting _level=max_rate
-    # forces the bucket to start "full" so the first send waits one period.
-    # max_retries adds a second layer: on 429 all concurrent requests pause
-    # until the ban lifts, then the request is retried.
-    rate_limiter = application.bot.rate_limiter
-    if rate_limiter and rate_limiter._base_limiter:
-        rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
-        logger.info("Pre-filled global rate limiter bucket")
+    dead_bindings = await session_manager.resolve_stale_ids()
 
     monitor = SessionMonitor()
 
@@ -2368,6 +2471,10 @@ async def post_init(application: Application) -> None:
     monitor.start()
     session_monitor = monitor
     logger.info("Session monitor started")
+
+    # Topics whose window died with the tmux server get their session back
+    if dead_bindings:
+        _revive_task = asyncio.create_task(_revive_topics(dead_bindings))
 
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
@@ -2399,22 +2506,18 @@ async def post_shutdown(application: Application) -> None:
 
 
 def create_bot() -> Application:
+    # At most 15 requests in any 30s across the whole bot (every topic lives
+    # in one private chat); a 429 stops ccbot instead of being retried.
+    rate_limiter = TelegramRateLimiter()
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        # One request every 2.2s across the whole bot. Telegram only
-        # tolerates ~1 msg/s per chat and every topic here lives in one
-        # private chat, which AIORateLimiter otherwise leaves unlimited.
-        # LoggingRateLimiter logs each request (see request_log.py).
-        .rate_limiter(
-            LoggingRateLimiter(
-                overall_max_rate=1, overall_time_period=2.2, max_retries=5
-            )
-        )
+        .rate_limiter(rate_limiter)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
+    rate_limiter.on_flood = application.stop_running
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))

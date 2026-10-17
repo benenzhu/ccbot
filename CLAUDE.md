@@ -16,13 +16,13 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 
 ## Core Design Constraints
 
-- **1 Topic = 1 Window = 1 Session** — all internal routing keyed by tmux window ID (`@0`, `@12`), not window name. Window names kept as display names. Same directory can have multiple windows.
+- **1 Topic = 1 Window = 1 Session** — all internal routing keyed by tmux window ID (`@0`, `@12`), not window name. Window names kept as display names. Same directory can have multiple windows. Exception: each subagent gets a read-only topic with no window (`handlers/subagent_topics.py`).
 - **Topic-only** — no backward-compat for non-topic mode. No `active_sessions`, no `/list`, no General topic routing.
 - **No message truncation** at parse layer — splitting only at send layer (`split_message`, 4096 char limit).
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
-- **Rate limiting** — `AIORateLimiter(overall_max_rate=1, overall_time_period=2.2, max_retries=5)` on the Application: one request per 2.2s bot-wide, because all topics share one private chat. On restart, the global bucket is pre-filled to avoid burst against Telegram's server-side counter.
+- **Rate limiting** — our own `TelegramRateLimiter` (`rate_limit.py`) on the Application: at most 15 requests in any 30s bot-wide (sliding window), because all topics share one private chat. A Telegram 429 stops ccbot instead of being retried — it means the window is wrong. On restart, the window starts filled to avoid a burst against Telegram's server-side counter.
 
 ## Code Conventions
 

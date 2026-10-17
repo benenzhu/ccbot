@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TextIO
 
-CAPACITY_PER_MIN = 60 / 2.2  # AIORateLimiter(overall_max_rate=1, period=2.2)
+CAPACITY_PER_MIN = 15 * 60 / 30  # rate_limit.py: 15 requests in any 30s
 BURST_GAP = timedelta(seconds=30)  # blank line in the timeline after a pause
 FOLLOW_POLL_SECONDS = 0.5
 

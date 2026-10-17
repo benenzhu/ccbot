@@ -7,6 +7,7 @@ Handles two execution modes:
 """
 
 import logging
+import socket
 import sys
 
 
@@ -41,8 +42,6 @@ def main() -> None:
         sys.exit(1)
 
     logging.getLogger("ccbot").setLevel(logging.DEBUG)
-    # AIORateLimiter (max_retries=5) handles retries itself; keep INFO for visibility
-    logging.getLogger("telegram.ext.AIORateLimiter").setLevel(logging.INFO)
     logger = logging.getLogger(__name__)
 
     from .tmux_manager import tmux_manager
@@ -59,6 +58,15 @@ def main() -> None:
 
     application = create_bot()
     application.run_polling(allowed_updates=["message", "callback_query"])
+
+    # A 429 stops the bot (rate_limit.py): say why on WeCom (Telegram is out)
+    # and as the last line
+    flood = getattr(application.bot.rate_limiter, "flood_message", None)
+    if flood:
+        from .alert import send_alert
+
+        send_alert(f"ccbot on {socket.gethostname()} stopped: {flood}")
+        sys.exit(f"ccbot stopped: {flood}")
 
 
 if __name__ == "__main__":

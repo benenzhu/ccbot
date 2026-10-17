@@ -116,13 +116,13 @@ class TestFormatToolUseSummary:
             TranscriptParser.format_tool_use_summary("Read", "not a dict") == "**Read**"
         )
 
-    def test_truncation_at_200_chars(self):
-        long_value = "x" * 250
-        result = TranscriptParser.format_tool_use_summary(
-            "Bash", {"command": long_value}
-        )
-        assert len(long_value) > 200
-        assert result == f"**Bash**({'x' * 200}…)"
+    def test_summary_is_one_short_line(self):
+        command = "cd /repo &&\n  " + "x" * 60
+        result = TranscriptParser.format_tool_use_summary("Bash", {"command": command})
+        one_line = ("cd /repo && " + "x" * 60)[:40]
+        assert result == f"**Bash**({one_line}…)"
+        assert TranscriptParser.tool_full_input("Bash", {"command": command}) == command
+        assert TranscriptParser.tool_full_input("Bash", {"command": "ls"}) == ""
 
 
 # ── extract_tool_result_text ─────────────────────────────────────────────
@@ -379,9 +379,13 @@ class TestParseEntries:
         tool_result_entries = [e for e in result if e.content_type == "tool_result"]
         assert len(tool_use_entries) == 1
         assert tool_use_entries[0].tool_use_id == "t1"
-        assert "**Read**" in tool_use_entries[0].text
+        # The whole call is one collapsed quote, led by its summary line
+        assert tool_use_entries[0].text == f"{EXPQUOTE_START}Read(app.py){EXPQUOTE_END}"
         assert len(tool_result_entries) == 1
         assert tool_result_entries[0].tool_use_id == "t1"
+        assert tool_result_entries[0].text == (
+            f"{EXPQUOTE_START}Read(app.py) -- Read 3 lines{EXPQUOTE_END}"
+        )
         assert not pending
 
     def test_thinking_block(self, make_jsonl_entry, make_thinking_block):
@@ -418,6 +422,205 @@ class TestParseEntries:
         assert len(texts) == 1
         assert "Step 1: do X" in texts[0].text
         assert len(tool_uses) >= 1
+
+    def test_narration_is_text_and_reasoning_stays_thinking(self, make_jsonl_entry):
+        """Narration: a thinking block with text, its signature tagged so."""
+        import base64
+
+        def sig(tag: bytes) -> str:
+            return base64.b64encode(b"\x08\x04\x12\x05" + tag + b"\x1a\x0c").decode()
+
+        entries = [
+            make_jsonl_entry(
+                "assistant",
+                [
+                    {"type": "thinking", "thinking": "", "signature": sig(b"x")},
+                    {
+                        "type": "thinking",
+                        "thinking": "job 13102 已在 node 06 启动。\n\n",
+                        "signature": sig(b"narration"),
+                    },
+                    {"type": "thinking", "thinking": "weighing options"},
+                ],
+            )
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+
+        assert [(e.content_type, e.text) for e in result] == [
+            ("narration", "job 13102 已在 node 06 启动。"),
+            ("thinking", f"{EXPQUOTE_START}weighing options{EXPQUOTE_END}"),
+        ]
+
+    def test_long_command_goes_in_full_after_the_output(
+        self, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+    ):
+        command = "for n in 03 05 06 07; do ssh do-mi355x-$n nvidia-smi; done"
+        entries = [
+            make_jsonl_entry(
+                "assistant", [make_tool_use_block("t1", "Bash", {"command": command})]
+            ),
+            make_jsonl_entry("user", [make_tool_result_block("t1", "GPU 0: idle")]),
+        ]
+        tool_use, tool_result = TranscriptParser.parse_entries(entries)[0]
+
+        summary = f"Bash({command[:40]}…)"
+        assert tool_use.text == f"{EXPQUOTE_START}{summary}\n{command}{EXPQUOTE_END}"
+        assert tool_result.text == (
+            f"{EXPQUOTE_START}{summary} -- Output 1 lines\n"
+            f"GPU 0: idle\n\n{command}{EXPQUOTE_END}"  # output, then the command
+        )
+
+    def test_notices_claude_code_writes_as_user_entries_are_folded(
+        self, make_jsonl_entry
+    ):
+        task = make_jsonl_entry(
+            "user",
+            "<task-notification>\n<task-id>ad70a95b</task-id>\n"
+            "<status>completed</status>\n"
+            '<summary>Agent "Watch job 13195" finished</summary>\n'
+            "<result>server stuck at profile run</result>\n</task-notification>",
+        )
+        task["origin"] = {"kind": "task-notification"}
+        peer = make_jsonl_entry(
+            "user",
+            "Another Claude session sent a message:\n"
+            '<cross-session-message from="uds:/x.sock" from-name="EP parallel">\n'
+            "Need one TP4 server tonight.\n</cross-session-message>",
+        )
+        peer["origin"] = {"kind": "peer"}
+        human = make_jsonl_entry("user", "我们目前在做啥呢？")
+        human["origin"] = {"kind": "human"}
+
+        result, _ = TranscriptParser.parse_entries([task, peer, human])
+
+        assert [(e.role, e.content_type) for e in result] == [
+            ("assistant", "notification"),
+            ("assistant", "notification"),
+            ("user", "text"),
+        ]
+        assert result[0].text == (
+            '🔔 Agent "Watch job 13195" finished\n'
+            f"{EXPQUOTE_START}status: completed\n"
+            f"result: server stuck at profile run{EXPQUOTE_END}"
+        )
+        assert result[1].text == (
+            f"📨 Message from EP parallel\n"
+            f"{EXPQUOTE_START}Need one TP4 server tonight.{EXPQUOTE_END}"
+        )
+        assert result[2].text == "我们目前在做啥呢？"
+
+    def test_message_sent_mid_turn_is_a_user_message(self, make_jsonl_entry):
+        """Claude Code queues it as an attachment, never as a user entry."""
+
+        def queued(prompt: str, kind: str, mode: str = "prompt") -> dict:
+            return {
+                "type": "attachment",
+                "timestamp": "2026-10-03T01:28:07.540Z",
+                "attachment": {
+                    "type": "queued_command",
+                    "prompt": prompt,
+                    "commandMode": mode,
+                    "origin": {"kind": kind},
+                },
+            }
+
+        entries = [
+            make_jsonl_entry("assistant", [{"type": "text", "text": "Working"}]),
+            queued("跑e2e好像有点慢？", "human"),
+            queued(
+                "<task-notification>done</task-notification>",
+                "task-notification",
+                "task-notification",
+            ),
+            queued("from another session", "peer"),
+        ]
+        result, _ = TranscriptParser.parse_entries(entries)
+
+        assert [(e.role, e.text, e.source_index) for e in result] == [
+            ("assistant", "Working", 0),
+            ("user", "跑e2e好像有点慢？", 1),
+        ]
+
+    @staticmethod
+    def _bash_that_edits(
+        make_jsonl_entry,
+        make_tool_use_block,
+        make_tool_result_block,
+        *,
+        stdout: str,
+        is_error: bool = False,
+    ):
+        """A Bash call whose result carries Claude Code's bashEditDiff."""
+        result = make_jsonl_entry(
+            "user",
+            [make_tool_result_block("t1", stdout, is_error=is_error)],
+            cwd="/repo",
+        )
+        result["toolUseResult"] = {
+            "stdout": stdout,
+            "bashEditDiff": {
+                "files": [
+                    {
+                        "filePath": "/repo/src/q.py",
+                        "hunks": [
+                            {
+                                "oldStart": 54,
+                                "oldLines": 3,
+                                "newStart": 54,
+                                "newLines": 2,
+                                "lines": [
+                                    " keep",
+                                    "-import gone",
+                                    "+import new",
+                                    "-import also_gone",
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "moreFiles": 0,
+            },
+        }
+        return [
+            make_jsonl_entry(
+                "assistant",
+                [make_tool_use_block("t1", "Bash", {"command": "sed -i x src/q.py"})],
+            ),
+            result,
+        ]
+
+    def test_bash_that_changed_files_shows_their_diff_before_the_output(
+        self, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+    ):
+        entries = self._bash_that_edits(
+            make_jsonl_entry, make_tool_use_block, make_tool_result_block, stdout="done"
+        )
+        result, _ = TranscriptParser.parse_entries(entries)
+        text = next(e.text for e in result if e.content_type == "tool_result")
+
+        assert text.startswith(
+            f"{EXPQUOTE_START}Bash(sed -i x src/q.py) -- Output 1 lines"
+            " -- Updated src/q.py (+1 -2)\n"
+        )
+        body = text.split("\n", 1)[1]
+        assert body.startswith("@@ -54,3 +54,2 @@\n keep\n-import gone\n")
+        assert body.index("+import new") < body.index("done")
+
+    def test_failed_bash_still_shows_the_files_it_changed(
+        self, make_jsonl_entry, make_tool_use_block, make_tool_result_block
+    ):
+        entries = self._bash_that_edits(
+            make_jsonl_entry,
+            make_tool_use_block,
+            make_tool_result_block,
+            stdout="Exit code 1",
+            is_error=True,
+        )
+        result, _ = TranscriptParser.parse_entries(entries)
+        text = next(e.text for e in result if e.content_type == "tool_result")
+
+        assert " -- Error: Exit code 1 -- Updated src/q.py (+1 -2)" in text
+        assert "-import gone" in text
 
     def test_edit_tool_diff_stats(
         self,

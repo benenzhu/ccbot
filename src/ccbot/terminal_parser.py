@@ -197,15 +197,37 @@ def is_interactive_ui(pane_text: str) -> bool:
 
 # Spinner characters Claude Code uses in its status line
 STATUS_SPINNERS = frozenset(["·", "✻", "✽", "✶", "✳", "✢"])
+# What a finished turn leaves in the status spot: "Brewed for 3m 14s · done …"
+_RE_TURN_DONE = re.compile(r"^\S+ for (?:\d+h )?(?:\d+m )?\d+s\b")
+# How far above the separator the status line may sit (its tip / todo sub-lines)
+STATUS_SEARCH_LINES = 20
+
+
+# Chrome separator: a full-width ──── line. The one above the prompt carries the
+# session name once it has one (/rename): "──────── ccbot dev ─".
+_RE_CHROME_SEPARATOR = re.compile(r"^─{20,}(?: .+ ─+)?$")
+
+
+def _find_chrome_separator(lines: list[str]) -> int | None:
+    """Index of the topmost chrome separator in the last 10 lines, if any."""
+    for i in range(max(0, len(lines) - 10), len(lines)):
+        if _RE_CHROME_SEPARATOR.match(lines[i].strip()):
+            return i
+    return None
 
 
 def parse_status_line(pane_text: str) -> str | None:
     """Extract the Claude Code status line from terminal output.
 
-    The status line (spinner + working text) appears immediately above
-    the chrome separator (a full line of ``─`` characters).  We locate
-    the separator first, then check the line just above it — this avoids
-    false positives from ``·`` bullets in Claude's regular output.
+    The status line (spinner + working text) sits just above the chrome
+    separator (a full line of ``─`` characters), possibly followed by
+    indented sub-lines (``⎿  Tip: …``, the todo list).  We locate the
+    separator first, then take the first unindented line above it: a
+    spinner there is the status; anything else (``●`` output, ``·`` bullets
+    in regular text) means there is none.
+
+    The line a finished turn leaves behind ("Brewed for 3m 14s · done
+    12:34 AM") is not a status: Claude is idle.
 
     Returns the text after the spinner, or None if no status line found.
     """
@@ -214,28 +236,44 @@ def parse_status_line(pane_text: str) -> str | None:
 
     lines = pane_text.split("\n")
 
-    # Find the chrome separator: topmost ──── line in the last 10 lines
-    chrome_idx: int | None = None
-    search_start = max(0, len(lines) - 10)
-    for i in range(search_start, len(lines)):
-        stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
-            chrome_idx = i
-            break
+    chrome_idx = _find_chrome_separator(lines)
 
     if chrome_idx is None:
         return None  # No chrome visible — can't determine status
 
-    # Check lines just above the separator (skip blanks, up to 4 lines)
-    for i in range(chrome_idx - 1, max(chrome_idx - 5, -1), -1):
-        line = lines[i].strip()
-        if not line:
+    # First unindented line above the separator (skip blanks and sub-lines)
+    for i in range(chrome_idx - 1, max(chrome_idx - 1 - STATUS_SEARCH_LINES, -1), -1):
+        line = lines[i]
+        if not line.strip() or line[0].isspace():
             continue
         if line[0] in STATUS_SPINNERS:
-            return line[1:].strip()
-        # First non-empty line above separator isn't a spinner → no status
+            text = line[1:].strip()
+            return None if _RE_TURN_DONE.match(text) else text
         return None
     return None
+
+
+# Background work in the bottom bar: "⏵⏵ bypass permissions on · 2 shells · …"
+_RE_BACKGROUND = re.compile(
+    r"·\s*(\d+)\s+(?:\w+\s+)?(?:shells?|agents?|tasks?|monitors?)\b"
+)
+
+
+def count_background_tasks(pane_text: str) -> int:
+    """Background shells / agents Claude Code lists in its bottom bar.
+
+    They run on after Claude's turn ends (e.g. "· 2 shells ·"); 0 when the
+    bar names none or no chrome is visible.
+    """
+    lines = pane_text.split("\n")
+    chrome_idx = _find_chrome_separator(lines)
+    if chrome_idx is None:
+        return 0
+    return sum(
+        int(m.group(1))
+        for line in lines[chrome_idx:]
+        for m in _RE_BACKGROUND.finditer(line)
+    )
 
 
 # ── Pane chrome stripping & bash output extraction ─────────────────────
@@ -246,7 +284,7 @@ def strip_pane_chrome(lines: list[str]) -> list[str]:
 
     The bottom of the pane looks like::
 
-        ────────────────────────  (separator)
+        ──────────── my-session ─  (separator; the name only after /rename)
         ❯                        (prompt)
         ────────────────────────  (separator)
           [Opus 4.6] Context: 34%
@@ -255,11 +293,9 @@ def strip_pane_chrome(lines: list[str]) -> list[str]:
     This function finds the topmost ``────`` separator in the last 10 lines
     and strips everything from there down.
     """
-    search_start = max(0, len(lines) - 10)
-    for i in range(search_start, len(lines)):
-        stripped = lines[i].strip()
-        if len(stripped) >= 20 and all(c == "─" for c in stripped):
-            return lines[:i]
+    chrome_idx = _find_chrome_separator(lines)
+    if chrome_idx is not None:
+        return lines[:chrome_idx]
     return lines
 
 

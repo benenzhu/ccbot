@@ -474,12 +474,56 @@ class TestCompactReplay:
         self, monitor, tmp_path, make_jsonl_entry, monkeypatch
     ):
         monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", False)
+        monkeypatch.setattr("ccbot.session_monitor.config.show_thinking", True)
         messages = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
 
         types = [m.content_type for m in messages]
         assert "tool_use" in types
         assert "tool_result" in types
         assert "thinking" in types
+
+    async def test_narration_is_sent_while_thinking_is_off(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        import base64
+
+        narration_sig = base64.b64encode(b"\x12\x09narration").decode()
+        path = tmp_path / "session.jsonl"
+        entry = make_jsonl_entry(
+            "assistant",
+            [
+                {"type": "thinking", "thinking": "reasoning"},
+                {
+                    "type": "thinking",
+                    "thinking": "job started",
+                    "signature": narration_sig,
+                },
+            ],
+        )
+        path.write_text(json.dumps(entry) + "\n")
+        monitor.state.update_session(
+            TrackedSession(session_id="s", file_path=str(path))
+        )
+        monkeypatch.setattr("ccbot.session_monitor.config.show_thinking", False)
+        monkeypatch.setattr(
+            monitor, "scan_projects", AsyncMock(return_value=[SessionInfo("s", path)])
+        )
+        messages = await monitor.check_for_updates({"s"})
+
+        assert [(m.content_type, m.text) for m in messages] == [
+            ("narration", "job started")
+        ]
+
+    async def test_thinking_is_not_sent_unless_enabled(
+        self, monitor, tmp_path, make_jsonl_entry, monkeypatch
+    ):
+        monkeypatch.setattr("ccbot.session_monitor.config.replay_compact", False)
+        monkeypatch.setattr("ccbot.session_monitor.config.show_thinking", False)
+        messages = await self._replay(monitor, tmp_path, make_jsonl_entry, monkeypatch)
+
+        types = [m.content_type for m in messages]
+        assert "tool_use" in types
+        assert "thinking" not in types
 
     async def test_history_reread_after_restart_is_still_replay(
         self, monitor, tmp_path, make_jsonl_entry, monkeypatch
@@ -591,3 +635,173 @@ class TestSessionTitle:
             monitor, path, [self._title("ccbot_rename")], monkeypatch
         )
         assert again == [("s", "ccbot_rename")]
+
+
+class TestSubagents:
+    """A watched session's subagents are read from their own transcripts."""
+
+    @pytest.fixture
+    def monitor(self, tmp_path, monkeypatch):
+        monitor = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor_state.json",
+        )
+        parent = tmp_path / "s.jsonl"
+        parent.write_text("")
+        monitor.state.update_session(
+            TrackedSession(
+                session_id="s",
+                file_path=str(parent),
+                subagents_since=1_000_000.0,
+            )
+        )
+        monkeypatch.setattr(
+            monitor, "scan_projects", AsyncMock(return_value=[SessionInfo("s", parent)])
+        )
+        return monitor
+
+    @staticmethod
+    def _entry(msg_type: str, content, *, at: str = "2026-10-15T07:00:00Z", **extra):
+        message: dict = {"content": content}
+        if "stop_reason" in extra:
+            message["stop_reason"] = extra.pop("stop_reason")
+        return {
+            "type": msg_type,
+            "message": message,
+            "timestamp": at,
+            "parentUuid": "p",
+            **extra,
+        }
+
+    def _write_agent(self, tmp_path, agent_id: str, entries: list[dict]) -> None:
+        agent_dir = tmp_path / "s" / "subagents"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        (agent_dir / f"agent-{agent_id}.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in entries)
+        )
+        (agent_dir / f"agent-{agent_id}.meta.json").write_text(
+            json.dumps({"agentType": "general-purpose", "description": "Watch job 7"})
+        )
+
+    async def test_a_new_subagent_is_read_from_its_first_line(self, monitor, tmp_path):
+        task = self._entry("user", "Watch job 7 until it ends.", parentUuid=None)
+        self._write_agent(
+            tmp_path,
+            "a1",
+            [
+                task,
+                self._entry(
+                    "user",
+                    [{"type": "text", "text": "Base directory for this skill: …"}],
+                    isMeta=True,
+                ),
+                self._entry(
+                    "assistant",
+                    [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": "squeue"},
+                        }
+                    ],
+                ),
+                self._entry(
+                    "user",
+                    [{"type": "tool_result", "tool_use_id": "t1", "content": "R"}],
+                ),
+                self._entry(
+                    "user",
+                    "The coordinator sent a message while you were working:\nstop",
+                    isMeta=True,
+                    origin={"kind": "coordinator"},
+                ),
+                self._entry(
+                    "assistant",
+                    [{"type": "text", "text": "Job 7 finished."}],
+                    stop_reason="end_turn",
+                ),
+            ],
+        )
+        messages = await monitor.check_for_updates({"s"})
+
+        assert [m.content_type for m in messages] == [
+            "notification",
+            "tool_use",
+            "tool_result",
+            "notification",
+            "text",
+        ]
+        assert {m.session_id for m in messages} == {"s"}  # the parent's
+        assert {m.agent_id for m in messages} == {"a1"}
+        assert {m.agent_description for m in messages} == {"Watch job 7"}
+        assert messages[0].text.startswith("📋 Task\n")
+        assert "Watch job 7 until it ends." in messages[0].text
+        assert messages[3].text.startswith("📨 Message from the main session\n")
+        assert [m.agent_finished for m in messages] == [False] * 4 + [True]
+        assert {m.role for m in messages} == {"assistant"}  # no 👤 echo
+
+        # Offsets are tracked under the agent's key, tied to the parent
+        tracked = monitor.state.get_session("agent-a1")
+        assert tracked is not None and tracked.parent_session_id == "s"
+        assert await monitor.check_for_updates({"s"}) == []
+
+    async def test_an_older_subagent_shows_what_it_writes_after_a_follow_up(
+        self, monitor, tmp_path
+    ):
+        old = "1970-01-01T00:00:01Z"  # before the session was watched
+        self._write_agent(
+            tmp_path,
+            "old",
+            [
+                self._entry("user", "old task", at=old, parentUuid=None),
+                self._entry(
+                    "assistant",
+                    [{"type": "text", "text": "old reply"}],
+                    at=old,
+                    stop_reason="end_turn",
+                ),
+            ],
+        )
+        assert await monitor.check_for_updates({"s"}) == []  # no history
+        assert monitor.state.get_session("agent-old") is not None
+
+        # The main session messages it again: appended to the same transcript
+        follow_up = [
+            self._entry(
+                "user",
+                "The coordinator sent a message while you were working:\nredo it",
+                isMeta=True,
+                origin={"kind": "coordinator"},
+            ),
+            self._entry(
+                "assistant",
+                [{"type": "text", "text": "redone"}],
+                stop_reason="end_turn",
+            ),
+        ]
+        path = tmp_path / "s" / "subagents" / "agent-old.jsonl"
+        with path.open("a") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in follow_up))
+        messages = await monitor.check_for_updates({"s"})
+
+        assert [m.agent_id for m in messages] == ["old", "old"]
+        assert messages[0].text.startswith("📨 Message from the main session\n")
+        assert messages[1].text == "redone"
+        assert messages[1].agent_finished
+
+    async def test_a_subagent_goes_when_its_session_goes(self, monitor, tmp_path):
+        monitor.state.update_session(
+            TrackedSession("agent-a1", "x", parent_session_id="s")
+        )
+        monitor.state.update_session(
+            TrackedSession("agent-a2", "y", parent_session_id="gone")
+        )
+        monitor._load_current_session_map = AsyncMock(return_value={"@1": "s"})
+        await monitor._cleanup_all_stale_sessions()
+        assert set(monitor.state.tracked_sessions) == {"s", "agent-a1"}
+
+        monitor._last_session_map = {"@1": "s"}
+        monitor._load_current_session_map = AsyncMock(return_value={})
+        await monitor._detect_and_cleanup_changes()
+        assert monitor.state.tracked_sessions == {}

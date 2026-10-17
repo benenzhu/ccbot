@@ -12,12 +12,17 @@ Provides a queue-based message processing system that ensures:
     what is still missing. Delivery releases the task's DeliveryTickets,
     which lets the monitor's persisted offset move past the message.
 
-Rate limiting: AIORateLimiter on the Application handles the global limit and
-groups, but has no per-chat limiter for private chats. This module therefore
-paces every chat itself (_pace / _try_pace): content waits for a send slot.
-Status is optional traffic: it goes out only when the bot-wide limiter is idle
-too (_status_slot_free), and a status line whose only change is its counters
-is refreshed at most every STATUS_COUNTER_REFRESH seconds.
+Rate limiting: TelegramRateLimiter (rate_limit.py) holds every request to a
+bot-wide sliding window. On top of it this module paces each chat (_pace /
+_try_pace: about one message a second after a short burst), so a full window
+doesn't go out in one go: content waits for a send slot. Status is optional
+traffic: it goes out only while the window keeps STATUS_RESERVE requests free
+for content (_status_slot_free). It only announces that Claude started
+working: one status message per turn, sent before Claude's first output, never
+edited — that first message takes its place — so it shows only the spinner
+text, without the counters that would go stale. Once a tool call or reply is
+on screen, Claude is evidently working (_turn_has_output): no more status
+until the turn ends or the user writes again.
 
 Saving requests under backlog: a tool_use whose tool_result is already queued
 is not sent and edited — the result goes out once, in the tool_use's place.
@@ -38,7 +43,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-from aiolimiter import AsyncLimiter
 from telegram import Bot
 from telegram.constants import MessageLimit
 from telegram.error import RetryAfter
@@ -46,11 +50,10 @@ from telegram.error import RetryAfter
 from ..config import config
 from ..markdown_v2 import ParsedTable, convert_markdown, table_to_markdown
 from ..monitor_state import DeliveryTicket
+from ..rate_limit import TelegramRateLimiter
 from ..request_log import request_purpose
 from ..screenshot import render_table_image
 from ..session import session_manager
-from ..terminal_parser import parse_status_line
-from ..tmux_manager import tmux_manager
 from ..tts import prepare_tts_segments, synthesize_prepared
 from .message_sender import (
     NO_LINK_PREVIEW,
@@ -118,6 +121,10 @@ _tool_msg_ids: dict[tuple[str, int, int], int] = {}
 # Status message tracking: (user_id, thread_id_or_0) -> (message_id, window_id, last_text)
 _status_msg_info: dict[tuple[int, int], tuple[int, str, str]] = {}
 
+# (user_id, thread_id_or_0) of topics whose current turn has output on screen:
+# no status for them until Claude goes idle or the user writes again
+_turn_has_output: set[tuple[int, int]] = set()
+
 # Flood control: user_id -> monotonic time when ban expires
 _flood_until: dict[int, float] = {}
 
@@ -170,46 +177,43 @@ def _try_pace(chat_id: int) -> bool:
     return _reserve_send_slot(chat_id, wait=False) is not None
 
 
-# A status line whose only change is its counters (elapsed time, tokens) is
-# refreshed at most this often; any other change shows on the next poll.
-STATUS_COUNTER_REFRESH = 30.0
-
-# (user_id, thread_id_or_0) -> monotonic time the status message was last set
-_status_shown_at: dict[tuple[int, int], float] = {}
-
-_RE_STATUS_NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+# The "(12s · ↓ 1.2k tokens · thinking with high effort)" tail of a status line
+_RE_STATUS_DETAILS = re.compile(r"\s*\(.*$")  # also when cut off by the pane width
 
 
-def _global_send_slot_free(bot: Bot) -> bool:
-    """True when the bot-wide rate limiter would let a request through now."""
-    rate_limiter = getattr(bot, "rate_limiter", None)
-    limiter = getattr(rate_limiter, "_base_limiter", None)
-    return not isinstance(limiter, AsyncLimiter) or limiter.has_capacity()
+def _status_label(status_line: str) -> str:
+    """What the status message shows: the status line without its details.
+
+    The message is never edited, so a timer or token count would go stale.
+    """
+    return _RE_STATUS_DETAILS.sub("", status_line) or status_line
+
+
+# Status uses the bot-wide window only while more than this many requests stay
+# free in it, so a burst of Claude's output still finds slots.
+STATUS_RESERVE = 5
 
 
 def _status_slot_free(bot: Bot, chat_id: int) -> bool:
-    """Take a send slot for status only if no other request would wait for it.
+    """Take a send slot for status only if Claude's output can spare it.
 
-    Every request shares one bot-wide slot per 2.2s, so a status edit queued
-    there delays Claude's actual output. Status goes out only when the global
-    limiter is idle and the chat has a slot free.
+    Status shares the bot-wide window with everything else; it goes out only
+    while more than STATUS_RESERVE requests are free there and the chat has a
+    slot free.
     """
-    return _global_send_slot_free(bot) and _try_pace(chat_id)
+    limiter = getattr(bot, "rate_limiter", None)
+    if (
+        isinstance(limiter, TelegramRateLimiter)
+        and limiter.window.free() <= STATUS_RESERVE
+    ):
+        return False
+    return _try_pace(chat_id)
 
 
-def _status_is_current(skey: tuple[int, int], window_id: str, text: str) -> bool:
-    """True when the status message on display needs no update for text."""
+def _status_shown(skey: tuple[int, int], window_id: str) -> bool:
+    """True when this window's status message is on display (it is never edited)."""
     info = _status_msg_info.get(skey)
-    if not info or info[1] != window_id:
-        return False
-    shown = info[2]
-    if shown == text:
-        return True
-    if _RE_STATUS_NUMBER.sub("#", shown) != _RE_STATUS_NUMBER.sub("#", text):
-        return False
-    # Only the counters moved: keep what is shown until it gets stale
-    age = time.monotonic() - _status_shown_at.get(skey, 0.0)
-    return age < STATUS_COUNTER_REFRESH
+    return info is not None and info[1] == window_id
 
 
 def _remember_status(
@@ -217,7 +221,6 @@ def _remember_status(
 ) -> None:
     """Track the status message now on display."""
     _status_msg_info[skey] = (msg_id, window_id, text)
-    _status_shown_at[skey] = time.monotonic()
 
 
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
@@ -645,7 +648,7 @@ async def _process_table_task(bot: Bot, user_id: int, task: MessageTask) -> None
     # The table is a new message: the status message must not stay above it
     await _do_clear_status_message(bot, user_id, task.thread_id or 0)
     await _send_task_tables(bot, chat_id, task)
-    await _check_and_send_status(bot, user_id, task.window_id or "", task.thread_id)
+    _turn_has_output.add((user_id, task.thread_id or 0))
 
 
 def _give_up_on_upload(task: MessageTask, error: Exception) -> bool:
@@ -783,8 +786,8 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
         await _do_clear_status_message(bot, user_id, tid)
     await _send_task_attachments(bot, chat_id, task)
 
-    # 5. After content, check and send status
-    await _check_and_send_status(bot, user_id, wid, task.thread_id)
+    # 5. Claude's output is on screen: no status for the rest of the turn
+    _turn_has_output.add((user_id, tid))
 
 
 async def _synthesize_segment(segment: str, user_id: int) -> bytes | None:
@@ -946,50 +949,15 @@ async def _process_status_update_task(
         await _do_clear_status_message(bot, user_id, tid)
         return
 
-    if _status_is_current(skey, wid, status_text):
-        return  # Same content (or only its counters moved lately)
+    if _status_shown(skey, wid) or skey in _turn_has_output:
+        return  # Shown once, never updated; none once Claude's output shows
     if not _status_slot_free(bot, chat_id):
         return  # Other traffic comes first; the next poll brings a fresher status
 
-    current_info = _status_msg_info.get(skey)
-    if current_info:
-        msg_id, stored_wid, _ = current_info
-
-        if stored_wid != wid:
-            # Window changed - delete old and send new
-            await _do_clear_status_message(bot, user_id, tid)
-            await _do_send_status_message(bot, user_id, tid, wid, status_text)
-        else:
-            # Same window, text changed - edit in place
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=_ensure_formatted(status_text),
-                    parse_mode=PARSE_MODE,
-                    link_preview_options=NO_LINK_PREVIEW,
-                )
-                _remember_status(skey, msg_id, wid, status_text)
-            except RetryAfter:
-                raise
-            except Exception:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=status_text,
-                        link_preview_options=NO_LINK_PREVIEW,
-                    )
-                    _remember_status(skey, msg_id, wid, status_text)
-                except RetryAfter:
-                    raise
-                except Exception as e:
-                    logger.debug(f"Failed to edit status message: {e}")
-                    _status_msg_info.pop(skey, None)
-                    await _do_send_status_message(bot, user_id, tid, wid, status_text)
-    else:
-        # No existing status message, send new
-        await _do_send_status_message(bot, user_id, tid, wid, status_text)
+    if skey in _status_msg_info:
+        # Another window's status in this topic
+        await _do_clear_status_message(bot, user_id, tid)
+    await _do_send_status_message(bot, user_id, tid, wid, status_text)
 
 
 async def _do_send_status_message(
@@ -1001,6 +969,7 @@ async def _do_send_status_message(
 ) -> None:
     """Send a new status message and track it (internal, called from worker)."""
     skey = (user_id, thread_id_or_0)
+    text = _status_label(text)
     thread_id: int | None = thread_id_or_0 if thread_id_or_0 != 0 else None
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     with request_purpose("status"):
@@ -1038,37 +1007,6 @@ async def _do_clear_status_message(
                 await bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except Exception as e:
             logger.debug(f"Failed to delete status message {msg_id}: {e}")
-
-
-async def _check_and_send_status(
-    bot: Bot,
-    user_id: int,
-    window_id: str,
-    thread_id: int | None = None,
-) -> None:
-    """Check terminal for status line and send status message if present."""
-    # Skip if there are more messages pending in the queue
-    queue = _message_queues.get(user_id)
-    if queue and not queue.empty():
-        return
-    # A status message still tracked for this window is still the last message
-    # (every new message consumes it), so the poller just edits it in place
-    info = _status_msg_info.get((user_id, thread_id or 0))
-    if info and info[1] == window_id:
-        return
-    w = await tmux_manager.find_window_by_id(window_id)
-    if not w:
-        return
-
-    pane_text = await tmux_manager.capture_pane(w.window_id)
-    if not pane_text:
-        return
-
-    tid = thread_id or 0
-    status_line = parse_status_line(pane_text)
-    chat_id = session_manager.resolve_chat_id(user_id, thread_id)
-    if status_line and _status_slot_free(bot, chat_id):
-        await _do_send_status_message(bot, user_id, tid, window_id, status_line)
 
 
 async def enqueue_content_message(
@@ -1174,10 +1112,17 @@ async def enqueue_status_update(
         return
 
     tid = thread_id or 0
+    skey = (user_id, tid)
 
-    # Deduplicate: skip if what's displayed needs no update
-    if status_text and _status_is_current((user_id, tid), window_id, status_text):
+    if status_text and not config.show_status:
         return
+    if status_text:
+        # A status message on display is never updated, and once the turn
+        # has output on screen there is none
+        if _status_shown(skey, window_id) or skey in _turn_has_output:
+            return
+    else:
+        _turn_has_output.discard(skey)  # the user wrote: a new turn
 
     queue = get_or_create_queue(bot, user_id)
 
@@ -1195,10 +1140,15 @@ async def enqueue_status_update(
 
 
 def clear_status_msg_info(user_id: int, thread_id: int | None = None) -> None:
-    """Clear status message tracking for a user (and optionally a specific thread)."""
+    """Forget a topic's status message; its next turn may show status again."""
     skey = (user_id, thread_id or 0)
     _status_msg_info.pop(skey, None)
-    _status_shown_at.pop(skey, None)
+    _turn_has_output.discard(skey)
+
+
+def end_turn(user_id: int, thread_id: int | None = None) -> None:
+    """Claude is idle in this topic: the next turn may show a status message."""
+    _turn_has_output.discard((user_id, thread_id or 0))
 
 
 def clear_tool_msg_ids_for_topic(user_id: int, thread_id: int | None = None) -> None:

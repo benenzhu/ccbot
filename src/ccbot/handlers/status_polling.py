@@ -4,6 +4,8 @@ Provides background polling of terminal status lines for all active users:
   - Detects Claude Code status (working, waiting, etc.)
   - Detects interactive UIs (permission prompts) not triggered via JSONL
   - Updates status messages in Telegram
+  - Keeps each topic's status light (🟢 working / 🟡 background) current,
+    subagent topics' too
   - Polls thread_bindings (each topic = one window)
   - Cleans up deleted topics (kills tmux window + unbinds thread) once a send
     to them has failed — Telegram sends no update on deletion, and probing
@@ -29,13 +31,15 @@ from .interactive_ui import (
     get_interactive_window,
     handle_interactive_ui,
 )
-from .message_queue import enqueue_status_update, get_message_queue
+from .message_queue import end_turn, enqueue_status_update, get_message_queue
 from .message_sender import is_topic_gone
+from .subagent_topics import update_subagent_lights
+from .topic_light import light_state, update_topic_light
 
 logger = logging.getLogger(__name__)
 
 # Status polling interval
-STATUS_POLL_INTERVAL = 5.0  # seconds - keep status edits from eating the send quota
+STATUS_POLL_INTERVAL = 5.0  # seconds
 
 
 async def update_status_message(
@@ -97,11 +101,19 @@ async def update_status_message(
         await handle_interactive_ui(bot, user_id, window_id, thread_id)
         return
 
+    status_line = parse_status_line(pane_text)
+    if thread_id is not None:
+        await update_topic_light(
+            bot,
+            user_id,
+            thread_id,
+            session_manager.get_display_name(window_id),
+            light_state(status_line, pane_text),
+        )
+
     # Normal status line check — skip if queue is non-empty
     if skip_status:
         return
-
-    status_line = parse_status_line(pane_text)
 
     if status_line:
         await enqueue_status_update(
@@ -111,7 +123,10 @@ async def update_status_message(
             status_line,
             thread_id=thread_id,
         )
-    # If no status line, keep existing status message (don't clear on transient state)
+    else:
+        # Claude is idle: the turn is over. Keep any status message (don't
+        # clear on transient state), but let the next turn show one again
+        end_turn(user_id, thread_id)
 
 
 async def status_poll_loop(bot: Bot) -> None:
@@ -169,6 +184,7 @@ async def status_poll_loop(bot: Bot) -> None:
                         f"Status update error for user {user_id} "
                         f"thread {thread_id}: {e}"
                     )
+            await update_subagent_lights(bot)
         except Exception as e:
             logger.error(f"Status poll loop error: {e}")
 

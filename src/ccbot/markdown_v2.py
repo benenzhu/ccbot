@@ -301,10 +301,9 @@ def convert_markdown(text: str) -> str:
     Expandable blockquote sections (marked by sentinel tokens from
     TranscriptParser) are extracted, escaped, and formatted separately
     so that telegramify_markdown doesn't mangle the >...|| syntax.
+    Markdown tables outside them become cards; inside (tool output,
+    thinking) they stay as written — the quote shows its text verbatim.
     """
-    # Convert markdown tables to card-style format before telegramify
-    text = convert_markdown_tables(text)
-
     # Extract expandable quote blocks before telegramify
     segments: list[tuple[bool, str]] = []  # (is_quote, content)
     last_end = 0
@@ -317,12 +316,12 @@ def convert_markdown(text: str) -> str:
         segments.append((False, text[last_end:]))
 
     if not segments:
-        return _markdownify(text)
+        return _markdownify(convert_markdown_tables(text))
 
     parts: list[str] = []
     for is_quote, segment in segments:
         if is_quote:
             parts.append(_EXPQUOTE_RE.sub(_render_expandable_quote, segment))
         else:
-            parts.append(_markdownify(segment))
+            parts.append(_markdownify(convert_markdown_tables(segment)))
     return "".join(parts)

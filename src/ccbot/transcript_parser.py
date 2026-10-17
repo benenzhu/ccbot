@@ -37,9 +37,9 @@ class ParsedEntry:
 
     role: str  # "user" | "assistant"
     text: str  # Already formatted text
-    content_type: (
-        str  # "text" | "thinking" | "tool_use" | "tool_result" | "local_command"
-    )
+    # "text" | "narration" | "notification" | "thinking" | "tool_use"
+    # | "tool_result" | "local_command"
+    content_type: str
     tool_use_id: str | None = None
     timestamp: str | None = None  # ISO timestamp from JSONL
     tool_name: str | None = (
@@ -61,6 +61,7 @@ class PendingToolInfo:
     summary: str  # Formatted tool summary (e.g. "**Read**(file.py)")
     tool_name: str  # Tool name (e.g. "Read", "Edit")
     input_data: Any = None  # Tool input parameters (for Edit to generate diff)
+    full_input: str = ""  # The input in full, when the summary line cut it short
 
 
 class TranscriptParser:
@@ -78,7 +79,10 @@ class TranscriptParser:
     # Magic string constants
     _NO_CONTENT_PLACEHOLDER = "(no content)"
     _INTERRUPTED_TEXT = "[Request interrupted by user for tool use]"
-    _MAX_SUMMARY_LENGTH = 200
+    # A tool's summary line fits one phone line; the input in full goes first
+    # in the collapsed quote (up to _MAX_FULL_INPUT_LENGTH)
+    _MAX_SUMMARY_LENGTH = 40
+    _MAX_FULL_INPUT_LENGTH = 1000
 
     @staticmethod
     def parse_line(line: str) -> dict | None:
@@ -167,19 +171,220 @@ class TranscriptParser:
             result_lines.append(line.rstrip("\n"))
         return "\n".join(result_lines)
 
+    _RE_XML_FIELD = re.compile(r"<([\w-]+)>(.*?)</\1>", re.DOTALL)
+    _RE_PEER_MESSAGE = re.compile(r"<([\w-]+-message)\b([^>]*)>(.*?)</\1>", re.DOTALL)
+    _RE_XML_ATTR = re.compile(r'([\w-]+)="([^"]*)"')
+    # Notification fields not worth showing (ids, the summary already shown)
+    _NOTIFICATION_HIDDEN_FIELDS = frozenset({"summary", "task-id", "tool-use-id"})
+
+    @classmethod
+    def _format_notification(cls, data: dict, text: str) -> str:
+        """A user entry Claude Code wrote itself, as one line + collapsed details.
+
+        Background task notices ("<task-notification>…") and messages from
+        other sessions or subagents ("Another Claude session sent a message:")
+        arrive as user entries (origin.kind task-notification / peer). They
+        are not the user's words; "" for anything else.
+        """
+        origin = data.get("origin")
+        kind = origin.get("kind") if isinstance(origin, dict) else None
+        stripped = text.strip()
+        if kind == "task-notification" or stripped.startswith("<task-notification>"):
+            inner = stripped.removeprefix("<task-notification>").removesuffix(
+                "</task-notification>"
+            )
+            fields = {
+                m.group(1): m.group(2).strip()
+                for m in cls._RE_XML_FIELD.finditer(inner)
+            }
+            head = "🔔 " + (fields.get("summary") or "Background task update")
+            details = "\n".join(
+                f"{key}: {value}"
+                for key, value in fields.items()
+                if key not in cls._NOTIFICATION_HIDDEN_FIELDS and value
+            )
+        elif kind == "peer" or stripped.startswith("Another Claude session sent"):
+            m = cls._RE_PEER_MESSAGE.search(stripped)
+            attrs = dict(cls._RE_XML_ATTR.findall(m.group(2))) if m else {}
+            sender = attrs.get("from-name") or attrs.get("from", "")
+            head = f"📨 Message from {sender}" if sender else "📨 Message"
+            details = m.group(3).strip() if m else stripped
+        else:
+            return ""
+        if not details:
+            return head
+        return f"{head}\n{cls._format_expandable_quote(details)}"
+
+    @classmethod
+    def format_subagent_input(cls, text: str, *, is_task: bool) -> str:
+        """What a subagent was told, as one line + the text collapsed.
+
+        Its task (its transcript's first message) and later messages from the
+        session that started it are not the user's words, so they get no 👤.
+        """
+        head = "📋 Task" if is_task else "📨 Message from the main session"
+        return f"{head}\n{cls._format_expandable_quote(text)}"
+
+    @staticmethod
+    def _is_narration(block: dict) -> bool:
+        """True for a thinking block that is a progress update for the user.
+
+        Recent models keep their reasoning hidden (thinking text empty) and
+        send short updates ("job 13102 started on node 06, waiting for …")
+        as thinking blocks whose signature is tagged "narration"; Claude Code
+        shows them as ordinary text.
+        """
+        signature = block.get("signature")
+        if not isinstance(signature, str) or not signature:
+            return False
+        try:
+            raw = base64.b64decode(signature + "=" * (-len(signature) % 4))
+        except ValueError:
+            return False
+        return b"narration" in raw
+
+    @staticmethod
+    def _queued_user_prompt(data: dict) -> str:
+        """Text of a message the user sent while Claude was mid-turn.
+
+        Claude Code queues such a message and records it as a queued_command
+        attachment, never as a user entry. Task notifications and other
+        non-human queued prompts give "".
+        """
+        att = data.get("attachment")
+        if not isinstance(att, dict) or att.get("type") != "queued_command":
+            return ""
+        origin = att.get("origin")
+        if att.get("commandMode") != "prompt" or not isinstance(origin, dict):
+            return ""
+        if origin.get("kind") != "human":
+            return ""
+        prompt = att.get("prompt")
+        if isinstance(prompt, list):
+            prompt = "\n".join(
+                b.get("text", "")
+                for b in prompt
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        return prompt.strip() if isinstance(prompt, str) else ""
+
+    @staticmethod
+    def _bash_edit_diff(data: dict) -> tuple[list[str], str]:
+        """Files a Bash command changed, from Claude Code's bashEditDiff.
+
+        Returns ("⎿  Updated <path> (+a -b)" lines, the hunks as a diff);
+        both empty when the command changed no file.
+        """
+        tool_result = data.get("toolUseResult")
+        edits = (
+            tool_result.get("bashEditDiff") if isinstance(tool_result, dict) else None
+        )
+        if not isinstance(edits, dict):
+            return [], ""
+        cwd = data.get("cwd") or ""
+        files = [f for f in edits.get("files") or [] if isinstance(f, dict)]
+        stats: list[str] = []
+        diff: list[str] = []
+        for f in files:
+            path = f.get("filePath", "")
+            if cwd and path.startswith(cwd.rstrip("/") + "/"):
+                path = path[len(cwd.rstrip("/")) + 1 :]
+            lines: list[str] = []
+            for h in f.get("hunks") or []:
+                lines.append(
+                    f"@@ -{h.get('oldStart')},{h.get('oldLines')} "
+                    f"+{h.get('newStart')},{h.get('newLines')} @@"
+                )
+                lines.extend(h.get("lines") or [])
+            added = sum(1 for line in lines if line.startswith("+"))
+            removed = sum(1 for line in lines if line.startswith("-"))
+            stats.append(f"  ⎿  Updated {path} (+{added} -{removed})")
+            if len(files) > 1:
+                diff.append(path)
+            diff.extend(lines)
+        more = edits.get("moreFiles") or 0
+        if more:
+            stats.append(f"  ⎿  … {more} more files changed")
+        return stats, "\n".join(diff)
+
     @classmethod
     def format_tool_use_summary(cls, name: str, input_data: dict | Any) -> str:
-        """Format a tool_use block into a brief summary line.
+        """Format a tool_use block into a one-line summary like "**Read**(file.py)".
 
-        Args:
-            name: Tool name (e.g. "Read", "Write", "Bash")
-            input_data: The tool input dict
-
-        Returns:
-            Formatted string like "**Read**(file.py)"
+        A longer input is cut short; tool_full_input has the rest for the
+        collapsed quote.
         """
-        if not isinstance(input_data, dict):
+        summary = cls._tool_summary_value(name, input_data)
+        if not summary:
             return f"**{name}**"
+        line = " ".join(summary.split())
+        if len(line) > cls._MAX_SUMMARY_LENGTH:
+            line = line[: cls._MAX_SUMMARY_LENGTH] + "…"
+        return f"**{name}**({line})"
+
+    @classmethod
+    def tool_full_input(cls, name: str, input_data: dict | Any) -> str:
+        """The tool's input in full when its summary line cut it short, else ""."""
+        summary = cls._tool_summary_value(name, input_data)
+        if len(" ".join(summary.split())) <= cls._MAX_SUMMARY_LENGTH:
+            return ""
+        if len(summary) > cls._MAX_FULL_INPUT_LENGTH:
+            return summary[: cls._MAX_FULL_INPUT_LENGTH] + "…"
+        return summary
+
+    # Lines that report a tool's result under its summary line
+    _STATS_PREFIXES = ("  ⎿  ", "⏹ ")
+    _RE_BOLD_TOOL_NAME = re.compile(r"^\*\*([^*]+)\*\*")
+
+    @classmethod
+    def _fold_tool_message(cls, text: str) -> str:
+        """A tool message as one collapsed quote, its summary line first.
+
+        "Bash(cmd…) -- Output 70 lines", then the output, then the input in
+        full: in Telegram the whole call is one small block. A quote shows its
+        text verbatim, so the tool name loses its bold.
+        """
+        start, end = cls.EXPANDABLE_QUOTE_START, cls.EXPANDABLE_QUOTE_END
+        head, _, rest = text.partition("\n")
+        head = cls._RE_BOLD_TOOL_NAME.sub(r"\1", head)
+        body = rest.replace(start, "").replace(end, "").strip("\n")
+        inner = f"{head}\n{body}" if body else head
+        return f"{start}{inner}{end}"
+
+    @classmethod
+    def _inline_stats(cls, text: str) -> str:
+        """Join the stats lines under a tool's summary line onto it.
+
+        "**Bash**(cmd…)\n  ⎿  Output 70 lines" → "**Bash**(cmd…) -- Output 70 lines"
+        """
+        head, *rest = text.split("\n")
+        while rest and rest[0].startswith(cls._STATS_PREFIXES):
+            line = rest.pop(0)
+            for prefix in cls._STATS_PREFIXES:
+                line = line.removeprefix(prefix)
+            head += f" -- {line.strip()}"
+        return "\n".join([head, *rest])
+
+    @classmethod
+    def _with_full_input(cls, text: str, full_input: str) -> str:
+        """Add a tool's full input at the end of the message's collapsed quote.
+
+        At the end: a collapsed quote previews its first lines, and the
+        output says more there than the command the summary line starts.
+        """
+        if not full_input:
+            return text
+        end = cls.EXPANDABLE_QUOTE_END
+        if end in text:
+            head, _, tail = text.rpartition(end)
+            return f"{head}\n\n{full_input}{end}{tail}"
+        return f"{text}\n{cls._format_expandable_quote(full_input)}"
+
+    @staticmethod
+    def _tool_summary_value(name: str, input_data: dict | Any) -> str:
+        """The input value a tool's summary shows (a path, command, query…)."""
+        if not isinstance(input_data, dict):
+            return ""
 
         # Pick a meaningful short summary based on tool name
         summary = ""
@@ -224,11 +429,7 @@ class TranscriptParser:
                     summary = v
                     break
 
-        if summary:
-            if len(summary) > cls._MAX_SUMMARY_LENGTH:
-                summary = summary[: cls._MAX_SUMMARY_LENGTH] + "…"
-            return f"**{name}**({summary})"
-        return f"**{name}**"
+        return summary if isinstance(summary, str) else ""
 
     @staticmethod
     def extract_tool_result_text(content: list | Any) -> str:
@@ -449,6 +650,18 @@ class TranscriptParser:
             tagged = len(result)
 
             msg_type = cls.get_message_type(data)
+            if msg_type == "attachment":
+                prompt = cls._queued_user_prompt(data)
+                if prompt:
+                    result.append(
+                        ParsedEntry(
+                            role="user",
+                            text=prompt,
+                            content_type="text",
+                            timestamp=cls.get_timestamp(data),
+                        )
+                    )
+                continue
             if msg_type not in ("user", "assistant"):
                 continue
 
@@ -518,6 +731,7 @@ class TranscriptParser:
                         name = block.get("name", "unknown")
                         inp = block.get("input", {})
                         summary = cls.format_tool_use_summary(name, inp)
+                        full_input = cls.tool_full_input(name, inp)
 
                         # ExitPlanMode: emit plan content as text before tool_use entry
                         if name == "ExitPlanMode" and isinstance(inp, dict):
@@ -541,12 +755,15 @@ class TranscriptParser:
                                 summary=summary,
                                 tool_name=name,
                                 input_data=input_data,
+                                full_input=full_input,
                             )
                             # Also emit tool_use entry with tool_name for immediate handling
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
-                                    text=summary,
+                                    text=cls._fold_tool_message(
+                                        cls._with_full_input(summary, full_input)
+                                    ),
                                     content_type="tool_use",
                                     tool_use_id=tool_id,
                                     timestamp=entry_timestamp,
@@ -557,7 +774,9 @@ class TranscriptParser:
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
-                                    text=summary,
+                                    text=cls._fold_tool_message(
+                                        cls._with_full_input(summary, full_input)
+                                    ),
                                     content_type="tool_use",
                                     tool_use_id=tool_id or None,
                                     timestamp=entry_timestamp,
@@ -567,9 +786,20 @@ class TranscriptParser:
 
                     elif btype == "thinking":
                         # Thinking stored without its text says nothing
-                        # worth a message, so only real thinking is shown
+                        # worth a message, so only real thinking is shown.
+                        # Narration is a progress update written for the
+                        # user that arrives as a thinking block: plain text.
                         thinking_text = block.get("thinking", "")
-                        if thinking_text:
+                        if thinking_text and cls._is_narration(block):
+                            result.append(
+                                ParsedEntry(
+                                    role="assistant",
+                                    text=thinking_text.strip(),
+                                    content_type="narration",
+                                    timestamp=entry_timestamp,
+                                )
+                            )
+                        elif thinking_text:
                             quoted = cls._format_expandable_quote(thinking_text)
                             result.append(
                                 ParsedEntry(
@@ -600,16 +830,19 @@ class TranscriptParser:
                         is_interrupted = result_text == cls._INTERRUPTED_TEXT
                         tool_info = pending_tools.pop(tool_use_id, None)
                         _tuid = tool_use_id or None
+                        bash_stats, bash_diff = cls._bash_edit_diff(data)
 
                         # Extract tool info from PendingToolInfo object
                         if tool_info is None:
                             tool_summary = None
                             tool_name = None
                             tool_input_data = None
+                            full_input = ""
                         else:
                             tool_summary = tool_info.summary
                             tool_name = tool_info.tool_name
                             tool_input_data = tool_info.input_data
+                            full_input = tool_info.full_input
 
                         if is_interrupted:
                             # Show interruption inline with tool summary
@@ -618,6 +851,11 @@ class TranscriptParser:
                                 entry_text += "\n⏹ Interrupted"
                             else:
                                 entry_text = "⏹ Interrupted"
+                            entry_text = cls._fold_tool_message(
+                                cls._with_full_input(
+                                    cls._inline_stats(entry_text), full_input
+                                )
+                            )
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
@@ -647,6 +885,17 @@ class TranscriptParser:
                                     )
                             else:
                                 entry_text += "\n  ⎿  Error"
+                            if bash_stats:
+                                entry_text += "\n" + "\n".join(bash_stats)
+                                if bash_diff:
+                                    entry_text += "\n" + cls._format_expandable_quote(
+                                        bash_diff
+                                    )
+                            entry_text = cls._fold_tool_message(
+                                cls._with_full_input(
+                                    cls._inline_stats(entry_text), full_input
+                                )
+                            )
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
@@ -685,6 +934,21 @@ class TranscriptParser:
                                             + "\n"
                                             + cls._format_expandable_quote(diff_text)
                                         )
+                            # Bash that changed files: their diff first (the
+                            # quote is cut to fit a message), then the output
+                            elif bash_stats:
+                                stats = list(bash_stats)
+                                if result_text:
+                                    lines = result_text.count("\n") + 1
+                                    stats.insert(0, f"  ⎿  Output {lines} lines")
+                                entry_text += "\n" + "\n".join(stats)
+                                quoted = "\n".join(
+                                    t for t in (bash_diff, result_text) if t
+                                )
+                                if quoted:
+                                    entry_text += "\n" + cls._format_expandable_quote(
+                                        quoted
+                                    )
                             # For other tools, append formatted result text
                             elif (
                                 result_text
@@ -693,6 +957,11 @@ class TranscriptParser:
                                 entry_text += "\n" + cls._format_tool_result_text(
                                     result_text, tool_name
                                 )
+                            entry_text = cls._fold_tool_message(
+                                cls._with_full_input(
+                                    cls._inline_stats(entry_text), full_input
+                                )
+                            )
                             result.append(
                                 ParsedEntry(
                                     role="assistant",
@@ -725,7 +994,21 @@ class TranscriptParser:
                             user_text_parts.append(t)
 
                 # Add user text if present (skip if message was only tool_results)
-                if user_text_parts:
+                notice = (
+                    cls._format_notification(data, "\n".join(user_text_parts))
+                    if user_text_parts
+                    else ""
+                )
+                if notice:
+                    result.append(
+                        ParsedEntry(
+                            role="assistant",
+                            text=notice,
+                            content_type="notification",
+                            timestamp=entry_timestamp,
+                        )
+                    )
+                elif user_text_parts:
                     combined = "\n".join(user_text_parts)
                     # Skip if it looks like local command XML
                     if not cls._RE_LOCAL_STDOUT.search(

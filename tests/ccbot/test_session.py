@@ -205,3 +205,84 @@ class TestPerMessageLookups:
 
     def test_session_file_for_window_without_session(self, mgr: SessionManager) -> None:
         assert mgr.session_file_for_window("@9") is None
+
+
+class TestResolveStaleIds:
+    """After the tmux server dies, bound topics come back as DeadBindings."""
+
+    async def test_dead_window_with_a_session_is_returned_for_resume(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ccbot.session import DeadBinding, WindowState
+
+        live = MagicMock(window_id="@2", window_name="kept")
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_windows", AsyncMock(return_value=[live])
+        )
+        monkeypatch.setattr(mgr, "_cleanup_stale_session_map_entries", AsyncMock())
+        monkeypatch.setattr(mgr, "_cleanup_old_format_session_map_keys", AsyncMock())
+        mgr.window_states = {
+            "@15": WindowState(session_id="s15", cwd="/w", window_name="vllm#713"),
+            "@16": WindowState(window_name="never started"),
+            "@9": WindowState(session_id="s9", cwd="/w", window_name="kept"),
+        }
+        mgr.window_display_names = {"@15": "vllm#713", "@16": "x", "@9": "kept"}
+        mgr.thread_bindings = {100: {1: "@15", 2: "@16", 3: "@9"}}
+
+        dead = await mgr.resolve_stale_ids()
+
+        assert dead == [DeadBinding(100, 1, "vllm#713", "s15", "/w")]
+        assert mgr.thread_bindings == {100: {3: "@2"}}  # same name: re-resolved
+
+
+class TestDisplayNameDrift:
+    """Display names are what ccbot named the window, not the hook's old name."""
+
+    async def test_session_map_names_only_unnamed_windows(
+        self, mgr: SessionManager, monkeypatch, tmp_path
+    ) -> None:
+        import json
+
+        session_map = tmp_path / "session_map.json"
+        session_map.write_text(
+            json.dumps(
+                {
+                    "ccbot:@54": {
+                        "session_id": "s",
+                        "cwd": "/w",
+                        "window_name": "ccbot",
+                    },
+                    "ccbot:@60": {"session_id": "t", "cwd": "/w", "window_name": "new"},
+                }
+            )
+        )
+        monkeypatch.setattr(config, "session_map_file", session_map)
+        monkeypatch.setattr(config, "tmux_session_name", "ccbot")
+        mgr.window_display_names = {"@54": "ccbot dev"}  # renamed after start
+
+        await mgr.load_session_map()
+
+        assert mgr.window_display_names == {"@54": "ccbot dev", "@60": "new"}
+
+    async def test_startup_repairs_drifted_names_from_tmux(
+        self, mgr: SessionManager, monkeypatch
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        live = [
+            MagicMock(window_id="@23", window_name="indexer cp"),
+            MagicMock(window_id="@31", window_name="fish"),  # not bound
+        ]
+        monkeypatch.setattr(
+            "ccbot.session.tmux_manager.list_windows", AsyncMock(return_value=live)
+        )
+        monkeypatch.setattr(mgr, "_cleanup_stale_session_map_entries", AsyncMock())
+        monkeypatch.setattr(mgr, "_cleanup_old_format_session_map_keys", AsyncMock())
+        mgr.window_display_names = {"@23": "100tok speed test", "@31": "old"}
+        mgr.thread_bindings = {100: {1: "@23"}}
+
+        await mgr.resolve_stale_ids()
+
+        assert mgr.window_display_names == {"@23": "indexer cp", "@31": "old"}

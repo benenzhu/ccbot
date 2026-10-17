@@ -15,6 +15,15 @@ History replays are compacted (config.replay_compact): thinking and tool
 messages are dropped, each run of them marked by a divider line at the top of
 the next message kept.
 
+Subagents (config.subagent_topics): each watched session's subagents write
+their own transcripts (<session>/subagents/agent-<id>.jsonl, the task in
+agent-<id>.meta.json). A subagent started after ccbot began watching the
+session is read from its first line; an older one from where it is, so it
+shows up again once it writes more (a follow-up from the main session is
+appended to the same transcript). Its messages carry agent_id (the bot sends
+them to the subagent's own topic). Its task and messages from the main
+session become notifications, not 👤 echoes.
+
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
 Key classes: SessionMonitor, NewMessage, SessionInfo.
@@ -26,6 +35,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +49,14 @@ from .utils import read_cwd_from_jsonl
 
 logger = logging.getLogger(__name__)
 
+# A session's subagent transcripts: <session>/subagents/agent-<id>.jsonl
+SUBAGENTS_DIR = "subagents"
+AGENT_KEY_PREFIX = "agent-"  # also the tracked-session key: "agent-<id>"
+
 # Compact replay: content types dropped, and the line that marks where they were
-REPLAY_DROPPED_TYPES = frozenset({"thinking", "tool_use", "tool_result"})
+REPLAY_DROPPED_TYPES = frozenset(
+    {"narration", "notification", "thinking", "tool_use", "tool_result"}
+)
 REPLAY_DIVIDER = "┄┄┄┄┄┄┄┄┄┄"
 
 
@@ -59,7 +75,9 @@ class NewMessage:
     session_id: str
     text: str
     is_complete: bool  # True when stop_reason is set (final message)
-    content_type: str = "text"  # "text", "thinking", "tool_use", "tool_result"
+    content_type: str = (
+        "text"  # "text", "narration", "thinking", "tool_use", "tool_result"
+    )
     tool_use_id: str | None = None
     role: str = "assistant"  # "user" or "assistant"
     tool_name: str | None = None  # For tool_use messages, the tool name
@@ -70,6 +88,13 @@ class NewMessage:
     # queues the message takes a hold(); the monitor releases its own
     # reference once the callback returns.
     ticket: DeliveryTicket | None = None
+    # A subagent's message (session_id is then the parent session's): which
+    # subagent, the task Claude gave it (3-5 words), its transcript, and
+    # whether this is the reply that ended its work
+    agent_id: str | None = None
+    agent_description: str = ""
+    agent_file: str = ""
+    agent_finished: bool = False
 
 
 class SessionMonitor:
@@ -117,6 +142,8 @@ class SessionMonitor:
         # Forks copy messages with their original UUIDs but rewrite the JSONL,
         # so a source byte offset cannot be used to skip inherited history.
         self._fork_history_uuids: dict[str, set[str]] = {}
+        # Each subagent's task description: agent key -> description
+        self._agent_descriptions: dict[str, str] = {}
 
     async def skip_fork_history(self, session_id: str, source_path: str) -> None:
         """Remember inherited message UUIDs before starting a fork without replay."""
@@ -488,6 +515,8 @@ class SessionMonitor:
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
                         continue
+                    if entry.content_type == "thinking" and not config.show_thinking:
+                        continue
 
                     line_offset = (
                         line_offsets[entry.source_index]
@@ -552,8 +581,187 @@ class SessionMonitor:
             except OSError as e:
                 logger.debug(f"Error processing session {session_info.session_id}: {e}")
 
+        if config.subagent_topics:
+            seen: set[str] = set()
+            for session_info in sessions:
+                parent = self.state.get_session(session_info.session_id)
+                if (
+                    session_info.session_id in active_session_ids
+                    and session_info.session_id not in seen
+                    and parent is not None
+                ):
+                    seen.add(session_info.session_id)
+                    new_messages.extend(
+                        await self._check_subagents(parent, session_info.file_path)
+                    )
+
         self.state.save_if_dirty()
         return new_messages
+
+    @staticmethod
+    def _first_timestamp(path: Path) -> float | None:
+        """When a transcript began (epoch seconds); None if not written yet."""
+        try:
+            with path.open("rb") as f:
+                for _ in range(5):  # a fork's first line has no timestamp
+                    line = f.readline()
+                    if not line.endswith(b"\n"):
+                        return None
+                    try:
+                        stamp = json.loads(line).get("timestamp")
+                        if isinstance(stamp, str):
+                            return datetime.fromisoformat(stamp).timestamp()
+                    except (ValueError, AttributeError):
+                        continue
+        except OSError:
+            pass
+        return None
+
+    def _agent_description(self, path: Path) -> str:
+        """The task Claude gave the subagent (agent-<id>.meta.json)."""
+        key = path.stem
+        if key not in self._agent_descriptions:
+            try:
+                meta = json.loads(path.with_suffix(".meta.json").read_text())
+                description = meta.get("description") if isinstance(meta, dict) else ""
+            except (OSError, ValueError):
+                return ""  # not written yet: ask again next time
+            self._agent_descriptions[key] = (
+                description.strip() if isinstance(description, str) else ""
+            )
+        return self._agent_descriptions[key]
+
+    @staticmethod
+    def _agent_entry_shown(entry: dict[str, Any]) -> bool:
+        """False for what Claude Code writes into a subagent's transcript for
+        the model only (compaction summaries, skill text); messages from the
+        main session (origin coordinator) are shown."""
+        if entry.get("isCompactSummary"):
+            return False
+        if entry.get("isMeta"):
+            origin = entry.get("origin")
+            return isinstance(origin, dict) and origin.get("kind") == "coordinator"
+        return True
+
+    async def _check_subagents(
+        self, parent: TrackedSession, parent_file: Path
+    ) -> list[NewMessage]:
+        """New messages from the subagents a session started."""
+        agent_dir = parent_file.with_suffix("") / SUBAGENTS_DIR
+        try:
+            paths = sorted(agent_dir.glob(f"{AGENT_KEY_PREFIX}*.jsonl"))
+        except OSError:
+            return []
+        messages: list[NewMessage] = []
+        for path in paths:
+            key = path.stem  # agent-<id>
+            tracked = self.state.get_session(key)
+            if tracked is None:
+                started = self._first_timestamp(path)
+                if started is None:
+                    continue  # nothing written yet
+                tracked = TrackedSession(
+                    session_id=key,
+                    file_path=str(path),
+                    parent_session_id=parent.session_id,
+                )
+                if started < parent.subagents_since:
+                    # Started before the session was watched: only what it
+                    # writes from now on (e.g. after a follow-up)
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    tracked.last_byte_offset = st.st_size
+                    self._file_mtimes[key] = st.st_mtime
+                else:
+                    logger.info(
+                        "Started tracking subagent %s of session %s",
+                        key,
+                        parent.session_id,
+                    )
+                self.state.update_session(tracked)
+            try:
+                messages.extend(await self._read_subagent(tracked, path))
+            except OSError as e:
+                logger.debug(f"Error processing subagent {key}: {e}")
+        return messages
+
+    async def _read_subagent(
+        self, tracked: TrackedSession, path: Path
+    ) -> list[NewMessage]:
+        """New messages in one subagent's transcript."""
+        key = tracked.session_id
+        st = path.stat()
+        if (
+            st.st_mtime <= self._file_mtimes.get(key, 0.0)
+            and st.st_size <= tracked.last_byte_offset
+        ):
+            return []
+        previous_offset = tracked.last_byte_offset
+        lines = [
+            (offset, entry)
+            for offset, entry in await self._read_new_lines_with_offsets(tracked, path)
+            if self._agent_entry_shown(entry)
+        ]
+        read_at = time.time()
+        self._file_mtimes[key] = st.st_mtime
+        entries = [entry for _, entry in lines]
+
+        parsed_entries, remaining = TranscriptParser.parse_entries(
+            entries, pending_tools=self._pending_tools.get(key, {})
+        )
+        if remaining:
+            self._pending_tools[key] = remaining
+        else:
+            self._pending_tools.pop(key, None)
+
+        agent_id = key.removeprefix(AGENT_KEY_PREFIX)
+        messages: list[NewMessage] = []
+        for entry in parsed_entries:
+            if not entry.text and not entry.image_data:
+                continue
+            if entry.content_type == "thinking" and not config.show_thinking:
+                continue
+            if 0 <= entry.source_index < len(lines):
+                line_offset, source = lines[entry.source_index]
+            else:
+                line_offset, source = previous_offset, {}
+            text, content_type, role = entry.text, entry.content_type, entry.role
+            if role == "user":
+                # Its task (the first message) or a message from the main
+                # session: not the user's words
+                text = TranscriptParser.format_subagent_input(
+                    text, is_task=source.get("parentUuid") is None
+                )
+                content_type, role = "notification", "assistant"
+            message = source.get("message")
+            finished = (
+                source.get("type") == "assistant"
+                and isinstance(message, dict)
+                and message.get("stop_reason") == "end_turn"
+            )
+            messages.append(
+                NewMessage(
+                    session_id=tracked.parent_session_id,
+                    text=text,
+                    is_complete=True,
+                    content_type=content_type,
+                    tool_use_id=entry.tool_use_id,
+                    role=role,
+                    tool_name=entry.tool_name,
+                    image_data=entry.image_data,
+                    read_at=read_at,
+                    ticket=self.state.open_ticket(tracked, line_offset),
+                    agent_id=agent_id,
+                    agent_description=self._agent_description(path),
+                    agent_file=str(path),
+                    agent_finished=finished,
+                )
+            )
+        if tracked.last_byte_offset != previous_offset:
+            self.state.update_session(tracked)
+        return messages
 
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.
@@ -588,20 +796,28 @@ class SessionMonitor:
         current_map = await self._load_current_session_map()
         active_session_ids = set(current_map.values())
 
-        stale_sessions = []
-        for session_id in self.state.tracked_sessions:
-            if session_id not in active_session_ids:
-                stale_sessions.append(session_id)
+        # A subagent goes with the session that started it
+        stale_sessions = {
+            session_id
+            for session_id, tracked in self.state.tracked_sessions.items()
+            if (tracked.parent_session_id or session_id) not in active_session_ids
+        }
 
         if stale_sessions:
             logger.info(
                 f"[Startup cleanup] Removing {len(stale_sessions)} stale sessions"
             )
-            for session_id in stale_sessions:
+            self._forget_sessions(stale_sessions)
+
+    def _forget_sessions(self, session_ids: set[str]) -> None:
+        """Stop tracking these sessions and the subagents they started."""
+        for session_id, tracked in list(self.state.tracked_sessions.items()):
+            if session_id in session_ids or tracked.parent_session_id in session_ids:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
                 self._fork_history_uuids.pop(session_id, None)
-            self.state.save_if_dirty()
+                self._pending_tools.pop(session_id, None)
+        self.state.save_if_dirty()
 
     async def _detect_and_cleanup_changes(self) -> dict[str, str]:
         """Detect session_map changes and cleanup replaced/removed sessions.
@@ -640,11 +856,7 @@ class SessionMonitor:
 
         # Perform cleanup
         if sessions_to_remove:
-            for session_id in sessions_to_remove:
-                self.state.remove_session(session_id)
-                self._file_mtimes.pop(session_id, None)
-                self._fork_history_uuids.pop(session_id, None)
-            self.state.save_if_dirty()
+            self._forget_sessions(sessions_to_remove)
 
         # Update last known map
         self._last_session_map = current_map

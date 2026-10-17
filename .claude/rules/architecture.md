@@ -73,13 +73,18 @@ Additional modules:
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py             ─ CLI entry point
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
-  request_log.py      ─ One log line per Telegram API request (LoggingRateLimiter);
+  rate_limit.py       ─ TelegramRateLimiter: 15 requests per 30s sliding window,
+                        stops ccbot on a Telegram 429
+  alert.py            ─ WeCom webhook message when a 429 stops ccbot (CCBOT_ALERT_WEBHOOK)
+  request_log.py      ─ One log line per Telegram API request (log_request);
                         scripts/api_log.py turns them into a traffic report
 
 Handler modules (handlers/):
   message_sender.py   ─ safe_reply/safe_edit/safe_send + rate_limit_send
   message_queue.py    ─ Per-user queue + worker (merge, status dedup)
   status_polling.py   ─ Background status line polling (5s interval)
+  topic_light.py      ─ 🟢 working / 🟡 background tasks / ✅ done (24h) in front of topic names
+  subagent_topics.py  ─ A read-only topic per subagent (sub-<parent>-<task>), its light
   response_builder.py ─ Response pagination and formatting
   interactive_ui.py   ─ AskUserQuestion / ExitPlanMode / Permission UI
   directory_browser.py─ Directory selection + session picker UI for new topics
@@ -89,7 +94,9 @@ Handler modules (handlers/):
 State files (~/.ccbot/ or $CCBOT_DIR/):
   state.json         ─ thread bindings + window states + display names + read offsets
   session_map.json   ─ hook-generated window_id→session mapping
-  monitor_state.json ─ poll progress (byte offset) per JSONL file
+  monitor_state.json ─ poll progress (byte offset) per JSONL file, subagents' too
+  topic_lights.json  ─ each lit topic's light, name and since when
+  subagent_topics.json ─ agent → its topic (user, thread, name, running)
 ```
 
 ## Key Design Decisions
@@ -100,6 +107,6 @@ State files (~/.ccbot/ or $CCBOT_DIR/):
 - **Tool use ↔ tool result pairing** — `tool_use_id` tracked across poll cycles; tool result edits the original tool_use Telegram message in-place.
 - **MarkdownV2 with fallback** — All messages go through `safe_reply`/`safe_edit`/`safe_send` which convert via `telegramify-markdown` and fall back to plain text on parse failure.
 - **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.
-- Only sessions registered in `session_map.json` (via hook) are monitored.
+- Only sessions registered in `session_map.json` (via hook) are monitored. Their subagents' transcripts (`<session>/subagents/agent-<id>.jsonl`) are monitored with them, and shown in topics of their own (no window behind them).
 - Notifications delivered to users via thread bindings (topic → window_id → session).
-- **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.
+- **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated. A bound topic whose window is gone entirely (the tmux server died: reboot, or logout without linger) gets its session resumed in a new window (`_revive_topics`: `claude --resume` in the same cwd, no replay) and is re-bound, instead of falling back to the directory browser.

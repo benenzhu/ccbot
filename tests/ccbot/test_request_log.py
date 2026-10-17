@@ -1,4 +1,7 @@
-"""Unit tests for request_log — one log line per Bot API request."""
+"""Unit tests for request_log — one log line per Bot API request.
+
+Requests go through TelegramRateLimiter, which logs each one when it finishes.
+"""
 
 import json
 import logging
@@ -7,12 +10,13 @@ import time
 import pytest
 from telegram.error import BadRequest
 
-from ccbot.request_log import LoggingRateLimiter, request_purpose
+from ccbot.rate_limit import TelegramRateLimiter
+from ccbot.request_log import request_purpose
 
 
-def _limiter() -> LoggingRateLimiter:
-    # No rate limiting: these tests are about the log line, not the timing
-    return LoggingRateLimiter(overall_max_rate=0, group_max_rate=0)
+def _limiter() -> TelegramRateLimiter:
+    # Not initialized, so the window starts empty: no waiting in these tests
+    return TelegramRateLimiter()
 
 
 async def test_logs_method_topic_message_and_text(caplog: pytest.LogCaptureFixture):
