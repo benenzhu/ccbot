@@ -449,9 +449,13 @@ _KEYS_SEND_MAP: dict[str, tuple[str, bool, bool]] = {
     "esc": ("Escape", False, False),
     "ent": ("Enter", False, False),
     "spc": ("Space", False, False),
-    "tab": ("Tab", False, False),
+    "bg": ("C-b", False, False),
     "cc": ("C-c", False, False),
 }
+
+# key_id → how often the key is sent. Claude Code in tmux backgrounds a running
+# tool call on Ctrl+B pressed twice (its hint: "ctrl+b ctrl+b (twice)").
+_KEY_REPEATS: dict[str, int] = {"bg": 2}
 
 # key_id → display label (shown in callback answer toast)
 _KEY_LABELS: dict[str, str] = {
@@ -462,7 +466,7 @@ _KEY_LABELS: dict[str, str] = {
     "esc": "⎋ Esc",
     "ent": "⏎ Enter",
     "spc": "␣ Space",
-    "tab": "⇥ Tab",
+    "bg": "^B ^B: to background",
     "cc": "^C",
 }
 
@@ -478,7 +482,7 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(
         [
-            [btn("␣ Space", "spc"), btn("↑", "up"), btn("⇥ Tab", "tab")],
+            [btn("␣ Space", "spc"), btn("↑", "up"), btn("^B ^B", "bg")],
             [btn("←", "lt"), btn("↓", "dn"), btn("→", "rt")],
             [btn("⎋ Esc", "esc"), btn("^C", "cc"), btn("⏎ Enter", "ent")],
             [
@@ -2186,9 +2190,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Window not found", show_alert=True)
             return
 
-        await tmux_manager.send_keys(
-            w.window_id, tmux_key, enter=enter, literal=literal
-        )
+        for _ in range(_KEY_REPEATS.get(key_id, 1)):
+            await tmux_manager.send_keys(
+                w.window_id, tmux_key, enter=enter, literal=literal
+            )
         await query.answer(_KEY_LABELS.get(key_id, key_id))
 
         # Refresh screenshot after key press

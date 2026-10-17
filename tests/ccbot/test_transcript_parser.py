@@ -9,6 +9,8 @@ from ccbot.transcript_parser import (
 
 EXPQUOTE_START = TranscriptParser.EXPANDABLE_QUOTE_START
 EXPQUOTE_END = TranscriptParser.EXPANDABLE_QUOTE_END
+# A tool call's quote opens with blank lines that fill its collapsed preview
+TOOL_START = EXPQUOTE_START + "\u2800\n" * 3
 
 
 # ── parse_line ───────────────────────────────────────────────────────────
@@ -379,12 +381,12 @@ class TestParseEntries:
         tool_result_entries = [e for e in result if e.content_type == "tool_result"]
         assert len(tool_use_entries) == 1
         assert tool_use_entries[0].tool_use_id == "t1"
-        # The whole call is one collapsed quote, led by its summary line
-        assert tool_use_entries[0].text == f"{EXPQUOTE_START}Read(app.py){EXPQUOTE_END}"
+        # The whole call is one collapsed quote: blank lines, then its summary
+        assert tool_use_entries[0].text == f"{TOOL_START}Read(app.py){EXPQUOTE_END}"
         assert len(tool_result_entries) == 1
         assert tool_result_entries[0].tool_use_id == "t1"
         assert tool_result_entries[0].text == (
-            f"{EXPQUOTE_START}Read(app.py) -- Read 3 lines{EXPQUOTE_END}"
+            f"{TOOL_START}Read(app.py) -- Read 3 lines{EXPQUOTE_END}"
         )
         assert not pending
 
@@ -464,9 +466,9 @@ class TestParseEntries:
         tool_use, tool_result = TranscriptParser.parse_entries(entries)[0]
 
         summary = f"Bash({command[:40]}…)"
-        assert tool_use.text == f"{EXPQUOTE_START}{summary}\n{command}{EXPQUOTE_END}"
+        assert tool_use.text == f"{TOOL_START}{summary}\n{command}{EXPQUOTE_END}"
         assert tool_result.text == (
-            f"{EXPQUOTE_START}{summary} -- Output 1 lines\n"
+            f"{TOOL_START}{summary} -- Output 1 lines\n"
             f"GPU 0: idle\n\n{command}{EXPQUOTE_END}"  # output, then the command
         )
 
@@ -599,10 +601,10 @@ class TestParseEntries:
         text = next(e.text for e in result if e.content_type == "tool_result")
 
         assert text.startswith(
-            f"{EXPQUOTE_START}Bash(sed -i x src/q.py) -- Output 1 lines"
+            f"{TOOL_START}Bash(sed -i x src/q.py) -- Output 1 lines"
             " -- Updated src/q.py (+1 -2)\n"
         )
-        body = text.split("\n", 1)[1]
+        body = text.removeprefix(TOOL_START).split("\n", 1)[1]
         assert body.startswith("@@ -54,3 +54,2 @@\n keep\n-import gone\n")
         assert body.index("+import new") < body.index("done")
 

@@ -336,20 +336,27 @@ class TranscriptParser:
     _STATS_PREFIXES = ("  ⎿  ", "⏹ ")
     _RE_BOLD_TOOL_NAME = re.compile(r"^\*\*([^*]+)\*\*")
 
+    # Blank lines atop a tool call's quote: they fill its collapsed preview
+    # (the client shows about 3 lines), so the call is an empty block until
+    # expanded. U+2800 (braille blank) is not whitespace, so Telegram keeps it;
+    # real blank lines at the start of a message would be trimmed.
+    _TOOL_FOLD_PAD = "\u2800\n" * 3
+
     @classmethod
     def _fold_tool_message(cls, text: str) -> str:
-        """A tool message as one collapsed quote, its summary line first.
+        """A tool message as one collapsed quote, blank until expanded.
 
-        "Bash(cmd…) -- Output 70 lines", then the output, then the input in
-        full: in Telegram the whole call is one small block. A quote shows its
-        text verbatim, so the tool name loses its bold.
+        Under _TOOL_FOLD_PAD: "Bash(cmd…) -- Output 70 lines", then the
+        output, then the input in full. In Telegram the whole call is one
+        small empty block, easy to skip. A quote shows its text verbatim, so
+        the tool name loses its bold.
         """
         start, end = cls.EXPANDABLE_QUOTE_START, cls.EXPANDABLE_QUOTE_END
         head, _, rest = text.partition("\n")
         head = cls._RE_BOLD_TOOL_NAME.sub(r"\1", head)
         body = rest.replace(start, "").replace(end, "").strip("\n")
         inner = f"{head}\n{body}" if body else head
-        return f"{start}{inner}{end}"
+        return f"{start}{cls._TOOL_FOLD_PAD}{inner}{end}"
 
     @classmethod
     def _inline_stats(cls, text: str) -> str:

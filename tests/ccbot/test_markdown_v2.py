@@ -48,6 +48,11 @@ class TestConvertMarkdown:
         assert EXP_END not in result
         assert ">quoted content||" in result
 
+    def test_blank_lines_atop_a_tool_call_stay_in_the_quote(self) -> None:
+        text = TranscriptParser._fold_tool_message("**Bash**(ls)\nout")
+        result = convert_markdown(text)
+        assert result == ">\u2800\n>\u2800\n>\u2800\n>Bash\\(ls\\)\n>out||"
+
     def test_mixed_text_and_expandable_quote(self) -> None:
         text = f"before {EXP_START}inside quote{EXP_END} after"
         result = convert_markdown(text)
