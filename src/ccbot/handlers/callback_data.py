@@ -7,7 +7,7 @@ Constants:
   - CB_HISTORY_*: History pagination
   - CB_DIR_*: Directory browser navigation
   - CB_WIN_*: Window picker (bind existing unbound window)
-  - CB_SCREENSHOT_*: Screenshot refresh
+  - CB_SCREENSHOT_*: Screenshot refresh, window size
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
 """
@@ -30,6 +30,7 @@ CB_WIN_CANCEL = "wb:cancel"
 
 # Screenshot
 CB_SCREENSHOT_REFRESH = "ss:ref:"
+CB_SCREENSHOT_RESIZE = "ss:rs:"  # ss:rs:<+|->:<window>
 
 # Interactive UI (aq: prefix kept for backward compatibility)
 CB_ASK_UP = "aq:up:"  # aq:up:<window>

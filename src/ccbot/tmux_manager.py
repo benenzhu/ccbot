@@ -4,6 +4,7 @@ Wraps libtmux to provide async-friendly operations on a single tmux session:
   - list_windows / find_window_by_name: discover Claude Code windows.
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
+  - window_size / resize_window: read and pin a window's size.
   - create_window / kill_window: lifecycle management.
 
 All blocking libtmux calls are wrapped in asyncio.to_thread().
@@ -344,6 +345,40 @@ class TmuxManager:
                 return False
 
         return await asyncio.to_thread(_sync_rename)
+
+    async def window_size(self, window_id: str) -> tuple[int, int] | None:
+        """A window's (width, height) in cells; None if it is gone."""
+
+        def _sync_size() -> tuple[int, int] | None:
+            result = self.server.cmd(
+                "display-message",
+                "-p",
+                "-t",
+                window_id,
+                "#{window_width} #{window_height}",
+            )
+            try:
+                width, height = (int(n) for n in result.stdout[0].split())
+            except (IndexError, ValueError):
+                return None
+            return width, height
+
+        return await asyncio.to_thread(_sync_size)
+
+    async def resize_window(self, window_id: str, width: int, height: int) -> bool:
+        """Resize a window; it keeps the size (window-size manual) until resized."""
+
+        def _sync_resize() -> bool:
+            result = self.server.cmd(
+                "resize-window", "-t", window_id, "-x", str(width), "-y", str(height)
+            )
+            if result.stderr:
+                logger.error(f"Failed to resize window {window_id}: {result.stderr}")
+                return False
+            logger.info("Resized window %s to %dx%d", window_id, width, height)
+            return True
+
+        return await asyncio.to_thread(_sync_resize)
 
     async def kill_window(self, window_id: str) -> bool:
         """Kill a tmux window by its ID."""

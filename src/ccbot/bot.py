@@ -7,7 +7,7 @@ Core responsibilities:
   - Command handlers: /start, /history, /screenshot, /esc, /kill, /unbind,
     plus forwarding unknown /commands to Claude Code via tmux.
   - Callback query handler: directory browser, history pagination,
-    interactive UI navigation, screenshot refresh.
+    interactive UI navigation, screenshot refresh and window size.
   - Topic-based routing: each named topic binds to one tmux window.
     Unbound topics trigger the directory browser to create a new session.
   - Photo handling: photos sent by user are downloaded and forwarded
@@ -45,6 +45,7 @@ from uuid import uuid4
 from telegram import (
     Bot,
     BotCommand,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -82,6 +83,7 @@ from .handlers.callback_data import (
     CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
     CB_SCREENSHOT_REFRESH,
+    CB_SCREENSHOT_RESIZE,
     CB_SESSION_CANCEL,
     CB_SESSION_FORK,
     CB_SESSION_NEW,
@@ -471,13 +473,35 @@ _KEY_LABELS: dict[str, str] = {
 }
 
 
+# ➖ / ➕ on the screenshot scale the tmux window by this factor, within limits
+WINDOW_SCALE = 1.2
+WINDOW_MIN_SIZE = (40, 10)
+WINDOW_MAX_SIZE = (400, 120)
+
+
+def _scaled_size(size: tuple[int, int], grow: bool) -> tuple[int, int]:
+    """A window size one step larger or smaller, kept within the limits."""
+    factor = WINDOW_SCALE if grow else 1 / WINDOW_SCALE
+    width, height = (
+        min(max(round(n * factor), low), high)
+        for n, low, high in zip(size, WINDOW_MIN_SIZE, WINDOW_MAX_SIZE)
+    )
+    return width, height
+
+
 def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
-    """Build inline keyboard for screenshot: control keys + refresh."""
+    """Build inline keyboard for screenshot: control keys, size, refresh."""
 
     def btn(label: str, key_id: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(
             label,
             callback_data=f"{CB_KEYS_PREFIX}{key_id}:{window_id}"[:64],
+        )
+
+    def resize_btn(label: str, direction: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            label,
+            callback_data=f"{CB_SCREENSHOT_RESIZE}{direction}:{window_id}"[:64],
         )
 
     return InlineKeyboardMarkup(
@@ -486,13 +510,34 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
             [btn("←", "lt"), btn("↓", "dn"), btn("→", "rt")],
             [btn("⎋ Esc", "esc"), btn("^C", "cc"), btn("⏎ Enter", "ent")],
             [
+                resize_btn("➖ Smaller", "-"),
                 InlineKeyboardButton(
                     "🔄 Refresh",
                     callback_data=f"{CB_SCREENSHOT_REFRESH}{window_id}"[:64],
-                )
+                ),
+                resize_btn("➕ Larger", "+"),
             ],
         ]
     )
+
+
+async def _redraw_screenshot(query: CallbackQuery, window_id: str) -> None:
+    """Capture the window again into the screenshot message, once it redrew."""
+    await asyncio.sleep(0.5)
+    text = await tmux_manager.capture_pane(window_id, with_ansi=True)
+    if not text:
+        return
+    png_bytes = await text_to_image(text, with_ansi=True)
+    try:
+        await query.edit_message_media(
+            media=InputMediaDocument(
+                media=io.BytesIO(png_bytes),
+                filename="screenshot.png",
+            ),
+            reply_markup=_build_screenshot_keyboard(window_id),
+        )
+    except Exception:
+        pass  # Screenshot unchanged or message too old
 
 
 async def topic_closed_handler(
@@ -1405,7 +1450,7 @@ async def _create_and_bind_window(
 
     Window launch and fork setup live in _launch_session_window.
     """
-    from telegram import CallbackQuery, User
+    from telegram import User
 
     assert isinstance(query, CallbackQuery)
     assert isinstance(user, User)
@@ -2195,23 +2240,25 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 w.window_id, tmux_key, enter=enter, literal=literal
             )
         await query.answer(_KEY_LABELS.get(key_id, key_id))
+        await _redraw_screenshot(query, window_id)
 
-        # Refresh screenshot after key press
-        await asyncio.sleep(0.5)
-        text = await tmux_manager.capture_pane(w.window_id, with_ansi=True)
-        if text:
-            png_bytes = await text_to_image(text, with_ansi=True)
-            keyboard = _build_screenshot_keyboard(window_id)
-            try:
-                await query.edit_message_media(
-                    media=InputMediaDocument(
-                        media=io.BytesIO(png_bytes),
-                        filename="screenshot.png",
-                    ),
-                    reply_markup=keyboard,
-                )
-            except Exception:
-                pass  # Screenshot unchanged or message too old
+    # Screenshot ➖ / ➕: scale the tmux window, then show it at the new size
+    elif data.startswith(CB_SCREENSHOT_RESIZE):
+        direction, _, window_id = data[len(CB_SCREENSHOT_RESIZE) :].partition(":")
+        size = await tmux_manager.window_size(window_id)
+        if size is None:
+            await query.answer("Window not found", show_alert=True)
+            return
+        new_size = _scaled_size(size, grow=direction == "+")
+        if new_size == size:
+            limit = "largest" if direction == "+" else "smallest"
+            await query.answer(f"{size[0]}x{size[1]} is already the {limit} size")
+            return
+        if not await tmux_manager.resize_window(window_id, *new_size):
+            await query.answer("Resize failed", show_alert=True)
+            return
+        await query.answer(f"{size[0]}x{size[1]} → {new_size[0]}x{new_size[1]}")
+        await _redraw_screenshot(query, window_id)
 
 
 # --- Streaming response / notifications ---

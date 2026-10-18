@@ -5,7 +5,7 @@
 │                         Telegram Bot (bot.py)                       │
 │  - Topic-based routing: 1 topic = 1 window = 1 session             │
 │  - /history: Paginated message history (default: latest page)      │
-│  - /screenshot: Capture tmux pane as PNG                           │
+│  - /screenshot: Capture tmux pane as PNG (keys, ➖/➕ window ×1.2) │
 │  - /esc: Send Escape to interrupt Claude                           │
 │  - /fork: Fork the session into a new topic, with a task           │
 │  - Send text → Claude Code via tmux keystrokes                     │
