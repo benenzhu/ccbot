@@ -782,7 +782,7 @@ def test_status_message_drops_details_that_would_go_stale(line: str, label: str 
 
 async def _limiter_with_free(free: int) -> TelegramRateLimiter:
     limiter = TelegramRateLimiter()
-    for _ in range(limiter.window.max_requests - free):
+    for _ in range(limiter.window.free() - free):
         await limiter.window.acquire()
     return limiter
 

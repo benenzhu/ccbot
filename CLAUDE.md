@@ -22,7 +22,7 @@ ccbot hook --install                  # Auto-install Claude Code SessionStart ho
 - **MarkdownV2 only** — use `safe_reply`/`safe_edit`/`safe_send` helpers (auto fallback to plain text). Internal queue/UI code calls bot API directly with its own fallback.
 - **Hook-based session tracking** — `SessionStart` hook writes `session_map.json`; monitor polls it to detect session changes.
 - **Message queue per user** — FIFO ordering, message merging (3800 char limit), tool_use/tool_result pairing.
-- **Rate limiting** — our own `TelegramRateLimiter` (`rate_limit.py`) on the Application: at most 15 requests in any 30s bot-wide (sliding window), because all topics share one private chat. A Telegram 429 stops ccbot instead of being retried — it means the window is wrong. On restart, the window starts filled to avoid a burst against Telegram's server-side counter.
+- **Rate limiting** — our own `TelegramRateLimiter` (`rate_limit.py`) on the Application: at most 15 requests in any 30s and 20 in any 60s bot-wide (sliding windows), because all topics share one private chat. 15/30s alone, run flat out for 4 minutes, got a 429: Telegram allows bursts, but only ~20 a minute sustained. A Telegram 429 stops ccbot instead of being retried — it means the window is wrong. On restart, the window starts filled to avoid a burst against Telegram's server-side counter.
 
 ## Code Conventions
 

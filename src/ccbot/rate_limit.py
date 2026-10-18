@@ -1,4 +1,4 @@
-"""Bot-wide Telegram rate limit: a sliding window, and a hard stop on flood control.
+"""Bot-wide Telegram rate limit: sliding windows, and a hard stop on flood control.
 
 Every topic lives in one private chat, so one bot-wide limit is the per-chat
 limit. TelegramRateLimiter replaces python-telegram-bot's AIORateLimiter on the
@@ -7,12 +7,13 @@ request that targets a chat — sends, edits, deletes, topic calls — waits for
 slot in the window, then goes out and is logged (request_log).
 
 Key components:
-  - SlidingWindow: at most WINDOW_MAX_REQUESTS requests in any WINDOW_SECONDS
-    seconds. A request that finds the window full waits for the oldest entry
-    to expire, so a burst goes out at once and only a sustained flow is slowed.
-    On startup the window is filled as if the bot had been sending at full
-    rate (Telegram's own counter outlives a restart): the first ~30s pace at
-    one request per WINDOW_SECONDS / WINDOW_MAX_REQUESTS seconds.
+  - SlidingWindow: for each of WINDOW_LIMITS, at most that many requests in
+    any that many seconds — 15 per 30s lets a burst out at once, 20 per 60s
+    holds a sustained flow to Telegram's 20 a minute (15 per 30s alone, run
+    flat out for 4 minutes, earned a ban). A request that finds a limit full
+    waits for its oldest entry to expire. On startup each limit is filled as
+    if the bot had been sending at its full rate (Telegram's own counter
+    outlives a restart): the first ~60s pace at one request per 3s.
   - TelegramRateLimiter: flood control (429 RetryAfter) means the window let
     too much through. Instead of retrying, it refuses every later request and
     calls on_flood (Application.stop_running) so ccbot stops; main posts
@@ -35,57 +36,64 @@ from .request_log import log_request
 
 logger = logging.getLogger(__name__)
 
-WINDOW_MAX_REQUESTS = 15
-WINDOW_SECONDS = 30.0
+# (max requests, in any this many seconds)
+WINDOW_LIMITS: tuple[tuple[int, float], ...] = ((15, 30.0), (20, 60.0))
 
 
 class SlidingWindow:
-    """At most max_requests acquisitions in any period seconds; waiters queue FIFO."""
+    """At most max_requests acquisitions in any period seconds, for each
+    (max_requests, period) limit; waiters queue FIFO."""
 
-    def __init__(self, max_requests: int, period: float) -> None:
-        self.max_requests = max_requests
-        self.period = period
-        self._sent: deque[float] = deque()  # monotonic times, oldest first
+    def __init__(self, *limits: tuple[int, float]) -> None:
+        self.limits = limits
+        # Per limit: monotonic times of the requests it counts, oldest first
+        self._sent: list[deque[float]] = [deque() for _ in limits]
         self._lock = asyncio.Lock()
 
     def _expire(self, now: float) -> None:
-        while self._sent and self._sent[0] <= now - self.period:
-            self._sent.popleft()
+        for (_, period), sent in zip(self.limits, self._sent):
+            while sent and sent[0] <= now - period:
+                sent.popleft()
 
     def free(self) -> int:
         """How many requests could go out right now."""
         self._expire(time.monotonic())
-        return self.max_requests - len(self._sent)
+        return min(n - len(sent) for (n, _), sent in zip(self.limits, self._sent))
 
     async def acquire(self) -> None:
-        """Take a slot, waiting for the oldest entry to expire if there is none."""
+        """Take a slot, waiting for the oldest entries of full limits to expire."""
         async with self._lock:
             while True:
                 now = time.monotonic()
                 self._expire(now)
-                if len(self._sent) < self.max_requests:
-                    self._sent.append(now)
+                waits = [
+                    sent[0] + period - now
+                    for (n, period), sent in zip(self.limits, self._sent)
+                    if len(sent) >= n
+                ]
+                if not waits:
+                    for sent in self._sent:
+                        sent.append(now)
                     return
-                await asyncio.sleep(self._sent[0] + self.period - now)
+                await asyncio.sleep(max(waits))
 
     def fill_evenly(self) -> None:
-        """Fill the window as if requests had gone out at full rate until now."""
+        """Fill each limit as if requests had gone out at its full rate until now."""
         now = time.monotonic()
-        step = self.period / self.max_requests
-        self._sent = deque(
-            now - self.period + step * (i + 1) for i in range(self.max_requests)
-        )
+        self._sent = [
+            deque(now - period + period / n * (i + 1) for i in range(n))
+            for n, period in self.limits
+        ]
+
+    def describe(self) -> str:
+        return " and ".join(f"{n} per {period:.0f}s" for n, period in self.limits)
 
 
 class TelegramRateLimiter(BaseRateLimiter[None]):
     """Sliding-window limiter that logs every request and stops ccbot on a 429."""
 
-    def __init__(
-        self,
-        max_requests: int = WINDOW_MAX_REQUESTS,
-        period: float = WINDOW_SECONDS,
-    ) -> None:
-        self.window = SlidingWindow(max_requests, period)
+    def __init__(self, limits: tuple[tuple[int, float], ...] = WINDOW_LIMITS) -> None:
+        self.window = SlidingWindow(*limits)
         self.on_flood: Callable[[], None] | None = None
         self.flood_message: str | None = None
         self._ban: timedelta | None = None
@@ -109,9 +117,9 @@ class TelegramRateLimiter(BaseRateLimiter[None]):
         lifted = time.strftime("%H:%M:%S", time.localtime(time.time() + seconds))
         self.flood_message = (
             f"Telegram flood control on {endpoint}: banned for "
-            f"{seconds:.0f}s (until {lifted}). The "
-            f"{self.window.max_requests} per {self.window.period:.0f}s window "
-            "let too much through — ccbot stopped; restart once the ban is over"
+            f"{seconds:.0f}s (until {lifted}). The rate limit "
+            f"({self.window.describe()}) let too much through — ccbot stopped; "
+            "restart once the ban is over"
         )
         logger.error(self.flood_message)
         if self.on_flood is not None:

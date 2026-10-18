@@ -73,7 +73,7 @@ Additional modules:
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py             ─ CLI entry point
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
-  rate_limit.py       ─ TelegramRateLimiter: 15 requests per 30s sliding window,
+  rate_limit.py       ─ TelegramRateLimiter: 15 per 30s + 20 per 60s sliding windows,
                         stops ccbot on a Telegram 429
   alert.py            ─ WeCom webhook message when a 429 stops ccbot (CCBOT_ALERT_WEBHOOK)
   request_log.py      ─ One log line per Telegram API request (log_request);

@@ -125,7 +125,7 @@ async def test_light_waits_while_the_window_is_short_of_room(lights: MagicMock):
 
     bot = AsyncMock()
     bot.rate_limiter = TelegramRateLimiter()
-    for _ in range(bot.rate_limiter.window.max_requests):
+    for _ in range(bot.rate_limiter.window.free()):
         await bot.rate_limiter.window.acquire()
     await topic_light.update_topic_light(bot, 5, 42, "vllm#713", "background")
     lights.now.return_value = 1100.0

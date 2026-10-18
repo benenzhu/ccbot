@@ -4,7 +4,7 @@
 Reads the one-line-per-request entries written by ccbot.request_log
 ("api sendMessage purpose=... msg=... wait=... text=...") and prints, for the
 bot's latest run by default:
-  - a summary: request rate vs. the 27/min the bot-wide limit allows, time
+  - a summary: request rate vs. the 20/min the bot-wide limit allows, time
     spent waiting for a slot, the bot's lag (read from the JSONL → sent), counts
     by API method and by purpose
   - hints at waste: failed requests, status churn, messages touched many times
@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TextIO
 
-CAPACITY_PER_MIN = 15 * 60 / 30  # rate_limit.py: 15 requests in any 30s
+CAPACITY_PER_MIN = 20  # rate_limit.py: 20 requests in any 60s (and 15 in 30s)
 BURST_GAP = timedelta(seconds=30)  # blank line in the timeline after a pause
 FOLLOW_POLL_SECONDS = 0.5
 

@@ -2511,8 +2511,9 @@ async def post_shutdown(application: Application) -> None:
 
 
 def create_bot() -> Application:
-    # At most 15 requests in any 30s across the whole bot (every topic lives
-    # in one private chat); a 429 stops ccbot instead of being retried.
+    # At most 15 requests in any 30s and 20 in any 60s across the whole bot
+    # (every topic lives in one private chat); a 429 stops ccbot instead of
+    # being retried.
     rate_limiter = TelegramRateLimiter()
     application = (
         Application.builder()

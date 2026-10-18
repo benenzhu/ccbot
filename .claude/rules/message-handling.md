@@ -39,10 +39,10 @@ Per-user message queues + worker pattern for all send tasks:
 
 ## Rate Limiting
 
-- `TelegramRateLimiter` (`rate_limit.py`) on the Application, in place of python-telegram-bot's `AIORateLimiter` (the library's `BaseRateLimiter` plug-in point): every request that targets a chat waits for a slot in a sliding window of 15 requests per 30s, bot-wide (every topic lives in one private chat). A burst goes out at once; only a sustained flow waits for the oldest entry to expire
+- `TelegramRateLimiter` (`rate_limit.py`) on the Application, in place of python-telegram-bot's `AIORateLimiter` (the library's `BaseRateLimiter` plug-in point): every request that targets a chat waits for a slot in sliding windows of 15 requests per 30s and 20 per 60s, bot-wide (every topic lives in one private chat). A burst of 15 goes out at once; a sustained flow is held to 20 a minute (15/30s alone, flat out for 4 minutes, earned a 429), and never waits much over 30s, so a busy topic still shows something every minute
 - On top of it the queue paces each chat (`_pace`: ~1 message/s after a burst of 3), so a full window doesn't go out in one go
 - On 429 ccbot stops: the limiter refuses every later request, calls `Application.stop_running()`, and `main` exits with the reason (ban length, when it lifts), first posting it to `CCBOT_ALERT_WEBHOOK` (a WeCom group-bot webhook, `alert.py`) if set. Undelivered messages are re-sent after the restart (offsets only advance on delivery)
-- On restart, the window starts filled as if the bot had been sending at full rate (Telegram's server-side counter outlives a restart): one request per 2s until it rolls over
+- On restart, the window starts filled as if the bot had been sending at full rate (Telegram's server-side counter outlives a restart): one request per 3s until the 60s window rolls over
 - Status polling interval: 5 seconds (skips enqueue when queue is non-empty)
 
 ## Performance Optimizations

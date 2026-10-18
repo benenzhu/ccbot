@@ -47,7 +47,7 @@ def clock() -> Iterator[_Clock]:
 
 
 async def test_a_burst_goes_out_at_once(clock: _Clock):
-    window = SlidingWindow(3, 30.0)
+    window = SlidingWindow((3, 30.0))
     for _ in range(3):
         await window.acquire()
     assert clock.now == 1000.0
@@ -55,7 +55,7 @@ async def test_a_burst_goes_out_at_once(clock: _Clock):
 
 
 async def test_a_full_window_waits_for_its_oldest_entry(clock: _Clock):
-    window = SlidingWindow(3, 30.0)
+    window = SlidingWindow((3, 30.0))
     for _ in range(3):  # at 1000, 1010, 1020
         await window.acquire()
         clock.now += 10
@@ -68,14 +68,39 @@ async def test_a_full_window_waits_for_its_oldest_entry(clock: _Clock):
     assert window.free() == 1
 
 
+async def test_a_sustained_flow_is_held_to_the_longer_limit(clock: _Clock):
+    window = SlidingWindow((15, 30.0), (20, 60.0))
+    for _ in range(15):  # the burst goes out at once
+        await window.acquire()
+    assert clock.now == 1000.0
+    assert window.free() == 0
+
+    await window.acquire()  # the 30s limit has room again at 1030
+    assert clock.now == 1030.0
+    for _ in range(4):
+        await window.acquire()
+    assert clock.now == 1030.0  # 20 in the last 60s
+    await window.acquire()  # waits for the burst to leave the 60s limit
+    assert clock.now == 1060.0
+
+
 async def test_startup_fill_frees_one_slot_per_step(clock: _Clock):
-    window = SlidingWindow(15, 30.0)
+    window = SlidingWindow((15, 30.0))
     window.fill_evenly()
     assert window.free() == 0
     clock.now += 2.0
     assert window.free() == 1
     clock.now += 28.0
     assert window.free() == 15
+
+
+async def test_startup_fill_paces_at_the_slowest_limit(clock: _Clock):
+    window = SlidingWindow((15, 30.0), (20, 60.0))
+    window.fill_evenly()
+    clock.now += 2.0
+    assert window.free() == 0  # 30s limit has a slot, 60s limit not yet
+    clock.now += 1.0
+    assert window.free() == 1
 
 
 async def test_requests_without_a_chat_skip_the_window(clock: _Clock):
@@ -88,7 +113,7 @@ async def test_requests_without_a_chat_skip_the_window(clock: _Clock):
     assert await limiter.process_request(call, (), {}, "getMe", {}, None)
     assert clock.now == 1000.0
     await limiter.process_request(call, (), {}, "sendMessage", {"chat_id": 1}, None)
-    assert clock.now == 1002.0
+    assert clock.now == 1003.0
 
 
 async def test_flood_control_stops_the_bot_and_refuses_later_requests(clock: _Clock):
