@@ -12,6 +12,7 @@ Per-user message queues + worker pattern for all send tasks:
 - tool_use breaks the merge chain and is sent separately (message ID recorded for later editing)
 - tool_result breaks the merge chain and is edited into the tool_use message (preventing order confusion)
 - Backlog: when a tool_use's tool_result is already queued, the tool_use is not sent — the result goes out once in its place (same final message, one request instead of send + edit)
+- Busy window: while the bot-wide window has `STATUS_RESERVE` (5) or fewer requests free (`_window_busy`), a topic's queued tool calls (each a tool_use with its tool_result queued, in a row) go out together, up to `TOOL_BATCH_MAX` (5) per message (`_batch_queued_tool_calls`). The collapsed preview's first line has a dot per call (`...` for three) in place of the first padding line; below the padding, the numbered summary lines, then each call's output and input, cut so the message fits 4096 chars. The topic's next non-tool message, or a tool still running, ends the batch
 - Merging stops when combined length exceeds 3800 characters (to avoid pagination)
 
 **Tables**: markdown tables in Claude's prose go out as native Telegram tables (one message each, at their position). Tool calls and thinking keep theirs inline — inside the collapsed quote they show verbatim, not as cards — since a message per table isn't worth its request there.
@@ -53,4 +54,4 @@ Per-user message queues + worker pattern for all send tasks:
 
 ## No Message Truncation
 
-Historical messages (tool_result text, user/assistant messages) are always kept in full — no character-level truncation at the parsing layer. Tool_use summary lines are the exception by design: one short line, with the input itself further down the collapsed quote. Long text is handled exclusively at the send layer: `split_message` splits by Telegram's 4096-character limit; real-time messages get `[1/N]` text suffixes, history pages get inline keyboard navigation.
+Historical messages (tool_result text, user/assistant messages) are always kept in full — no character-level truncation at the parsing layer. Tool_use summary lines are the exception by design: one short line, with the input itself further down the collapsed quote. So are tool calls batched under a busy window: their output is cut to fit one message. Long text is handled exclusively at the send layer: `split_message` splits by Telegram's 4096-character limit; real-time messages get `[1/N]` text suffixes, history pages get inline keyboard navigation.

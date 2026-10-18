@@ -26,7 +26,10 @@ until the turn ends or the user writes again.
 
 Saving requests under backlog: a tool_use whose tool_result is already queued
 is not sent and edited — the result goes out once, in the tool_use's place.
-Tasks for a topic that turned out deleted are dropped.
+While the bot-wide window is short of room (_window_busy), a topic's queued
+tool calls go out together, up to TOOL_BATCH_MAX in one message, their output
+cut to fit (_batch_queued_tool_calls). Tasks for a topic that turned out
+deleted are dropped.
 
 Key components:
   - MessageTask: Dataclass representing a queued message task (with thread_id)
@@ -54,6 +57,7 @@ from ..rate_limit import TelegramRateLimiter
 from ..request_log import request_purpose
 from ..screenshot import render_table_image
 from ..session import session_manager
+from ..transcript_parser import TranscriptParser
 from ..tts import prepare_tts_segments, synthesize_prepared
 from .message_sender import (
     NO_LINK_PREVIEW,
@@ -194,6 +198,15 @@ def _status_label(status_line: str) -> str:
 STATUS_RESERVE = 5
 
 
+def _window_busy(bot: Bot) -> bool:
+    """True while the bot-wide window has STATUS_RESERVE or fewer requests free."""
+    limiter = getattr(bot, "rate_limiter", None)
+    return (
+        isinstance(limiter, TelegramRateLimiter)
+        and limiter.window.free() <= STATUS_RESERVE
+    )
+
+
 def _status_slot_free(bot: Bot, chat_id: int) -> bool:
     """Take a send slot for status only if Claude's output can spare it.
 
@@ -201,11 +214,7 @@ def _status_slot_free(bot: Bot, chat_id: int) -> bool:
     while more than STATUS_RESERVE requests are free there and the chat has a
     slot free.
     """
-    limiter = getattr(bot, "rate_limiter", None)
-    if (
-        isinstance(limiter, TelegramRateLimiter)
-        and limiter.window.free() <= STATUS_RESERVE
-    ):
+    if _window_busy(bot):
         return False
     return _try_pace(chat_id)
 
@@ -409,10 +418,105 @@ async def _absorb_queued_tool_result(
 
     if result is None:
         return task, 0
+    return _as_one_call(task, result), 1
+
+
+def _as_one_call(tool_use: MessageTask, result: MessageTask) -> MessageTask:
+    """The tool_result, sent in its tool_use's place."""
     # The tool_use's receipts ride along: its source is delivered with the result
-    result.tickets = task.tickets + result.tickets
-    result.read_at = _earliest(task.read_at, result.read_at)
-    return result, 1
+    result.tickets = tool_use.tickets + result.tickets
+    result.read_at = _earliest(tool_use.read_at, result.read_at)
+    return result
+
+
+# While the window is busy, up to this many tool calls of a topic share a message
+TOOL_BATCH_MAX = 5
+
+
+def _same_topic(a: MessageTask, b: MessageTask) -> bool:
+    return a.window_id == b.window_id and a.thread_id == b.thread_id
+
+
+async def _batch_queued_tool_calls(
+    queue: asyncio.Queue[MessageTask],
+    first: MessageTask,
+    lock: asyncio.Lock,
+) -> tuple[MessageTask, int]:
+    """Send a topic's queued tool calls along with first, as one message.
+
+    first is a whole tool call: a tool_result that absorbed its tool_use.
+    The topic's next queued tasks join it while each is a tool_use whose
+    tool_result is queued too, up to TOOL_BATCH_MAX calls; anything else of
+    the topic ends the batch, so its messages keep their order. Other
+    topics' tasks stay where they are.
+
+    Returns: (task_to_send, taken_count) — taken_count tasks were taken out
+    of the queue (caller marks them done).
+    """
+    calls = [first]
+    taken: set[int] = set()
+    async with lock:
+        items = _inspect_queue(queue)
+        for i, item in enumerate(items):
+            if len(calls) >= TOOL_BATCH_MAX:
+                break
+            if i in taken or not _same_topic(item, first):
+                continue
+            if item.task_type != "content" or item.content_type != "tool_use":
+                break
+            j = next(
+                (
+                    k
+                    for k in range(i + 1, len(items))
+                    if k not in taken and _is_result_of(item, items[k])
+                ),
+                None,
+            )
+            if j is None:
+                break  # still running
+            taken.update((i, j))
+            calls.append(_as_one_call(item, items[j]))
+        for i, item in enumerate(items):
+            if i in taken:
+                continue
+            queue.put_nowait(item)
+            # Compensate: already counted when first enqueued
+            queue.task_done()
+
+    if len(calls) == 1:
+        return first, 0
+    text = _fold_tool_batch([call.text or "\n".join(call.parts) for call in calls])
+    images = [image for call in calls for image in call.image_data or []]
+    read_at = first.read_at
+    for call in calls[1:]:
+        read_at = _earliest(read_at, call.read_at)
+    return (
+        MessageTask(
+            task_type="content",
+            text=text,
+            window_id=first.window_id,
+            parts=[text],
+            content_type="tool_result",  # nothing to edit: no tool_use_id
+            thread_id=first.thread_id,
+            image_data=images or None,
+            tickets=[ticket for call in calls for ticket in call.tickets],
+            read_at=read_at,
+        ),
+        len(taken),
+    )
+
+
+def _fold_tool_batch(texts: list[str]) -> str:
+    """The calls as one message, each call's output cut until it fits."""
+    body_chars = MERGE_MAX_LENGTH // len(texts)
+    while True:
+        text = TranscriptParser.fold_tool_batch(texts, body_chars)
+        if (
+            len(_ensure_formatted(text)) <= MessageLimit.MAX_TEXT_LENGTH
+            or body_chars < 50
+        ):
+            return text
+        body_chars //= 2
 
 
 async def _message_queue_worker(bot: Bot, user_id: int) -> None:
@@ -452,6 +556,16 @@ async def _message_queue_worker(bot: Bot, user_id: int) -> None:
                             f"Sent tool_result in place of its tool_use "
                             f"{task.tool_use_id} for user {user_id}"
                         )
+                        if _window_busy(bot):
+                            task, batched = await _batch_queued_tool_calls(
+                                queue, task, lock
+                            )
+                            if batched:
+                                logger.debug(
+                                    f"Batched {batched // 2 + 1} tool calls "
+                                    f"for user {user_id}"
+                                )
+                            absorbed += batched
                     # Try to merge consecutive content tasks
                     task, merge_count = await _merge_content_tasks(queue, task, lock)
                     if merge_count > 0:

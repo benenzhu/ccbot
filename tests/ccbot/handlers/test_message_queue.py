@@ -765,6 +765,99 @@ async def test_worker_sends_backlogged_tool_call_once_instead_of_send_plus_edit(
     assert ("A", 4444, 42) not in message_queue._tool_msg_ids
 
 
+def _tool_call(tool_id: str, thread_id: int | None = 42) -> list[MessageTask]:
+    """A tool_use and its tool_result; the result's text is the folded call."""
+    tool_use = _tool_task("tool_use", tool_id, thread_id)
+    result = _tool_task("tool_result", tool_id, thread_id)
+    result.text = message_queue.TranscriptParser._fold_tool_message(
+        f"Bash({tool_id}) -- Output 1 line\nout {tool_id}"
+    )
+    return [tool_use, result]
+
+
+async def test_queued_tool_calls_of_a_topic_go_out_as_one_message():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    first_use, first = _tool_call("A")
+    first_use.tickets = [_ticket()[0]]
+    other_topic = _tool_task("tool_use", "X", thread_id=43)
+    use_b, result_b = _tool_call("B")
+    use_c, result_c = _tool_call("C")
+    reply = MessageTask(task_type="content", window_id="@1", thread_id=42)
+    use_d, result_d = _tool_call("D")
+    for item in (use_b, other_topic, use_c, result_b, result_c, reply, use_d, result_d):
+        queue.put_nowait(item)
+    first = message_queue._as_one_call(first_use, first)
+
+    sent, taken = await message_queue._batch_queued_tool_calls(
+        queue, first, asyncio.Lock()
+    )
+
+    assert taken == 4
+    assert sent.tool_use_id is None  # sent as it is, never edited
+    assert sent.tickets == first_use.tickets
+    lines = (sent.text or "").split("\n")
+    assert lines[0].endswith("...")  # a dot per call, in the collapsed preview
+    assert "1. Bash(A) -- Output 1 line" in lines
+    assert "3. Bash(C) -- Output 1 line" in lines
+    assert "── 3 ──\nout C" in (sent.text or "")
+    # The topic's reply ends the batch; everything else keeps its order
+    assert [queue.get_nowait() for _ in range(4)] == [
+        other_topic,
+        reply,
+        use_d,
+        result_d,
+    ]
+
+
+async def test_a_batch_stops_at_a_running_tool_and_at_five_calls():
+    queue: asyncio.Queue[MessageTask] = asyncio.Queue()
+    running = _tool_task("tool_use", "R")
+    queue.put_nowait(running)
+    sent, taken = await message_queue._batch_queued_tool_calls(
+        queue, _tool_call("A")[1], asyncio.Lock()
+    )
+    assert taken == 0 and sent.tool_use_id == "A"
+    assert queue.get_nowait() is running
+
+    for tool_id in "BCDEFG":
+        for item in _tool_call(tool_id):
+            queue.put_nowait(item)
+    sent, taken = await message_queue._batch_queued_tool_calls(
+        queue, _tool_call("A")[1], asyncio.Lock()
+    )
+    assert taken == 8  # B..E with A makes five
+    assert (sent.text or "").split("\n")[0].endswith(".....")
+    assert queue.qsize() == 4  # F and G
+
+
+@pytest.mark.usefixtures("_clean_status_state")
+async def test_worker_batches_tool_calls_only_while_the_window_is_busy():
+    async def sends(free: int) -> list[str]:
+        bot = AsyncMock()
+        bot.rate_limiter = await _limiter_with_free(free)
+        send = AsyncMock(return_value=AsyncMock(message_id=1))
+        resolve, fallback, status, sleep = _content_patches(send)
+        with resolve, fallback, status, sleep:
+            queue = message_queue.get_or_create_queue(bot, 4445)
+            try:
+                for tool_id in "AB":
+                    for item in _tool_call(tool_id):
+                        queue.put_nowait(item)
+                await asyncio.wait_for(queue.join(), 1)
+            finally:
+                message_queue._queue_workers.pop(4445).cancel()
+                message_queue._message_queues.pop(4445, None)
+                message_queue._queue_locks.pop(4445, None)
+        return [call.args[2] for call in send.await_args_list]
+
+    assert await sends(message_queue.STATUS_RESERVE + 1) == [
+        "tool_result A",
+        "tool_result B",
+    ]
+    (batch,) = await sends(message_queue.STATUS_RESERVE)
+    assert "1. Bash(A)" in batch and "2. Bash(B)" in batch
+
+
 # --- Status is optional traffic: it yields to everything else ---
 
 

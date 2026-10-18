@@ -348,7 +348,8 @@ class TranscriptParser:
     # (the client shows about 3 lines), so the call is an empty block until
     # expanded. U+2800 (braille blank) is not whitespace, so Telegram keeps it;
     # real blank lines at the start of a message would be trimmed.
-    _TOOL_FOLD_PAD = "\u2800\n" * 3
+    _TOOL_FOLD_PAD_LINE = "\u2800\n"
+    _TOOL_FOLD_PAD = _TOOL_FOLD_PAD_LINE * 3
 
     @classmethod
     def _fold_tool_message(cls, text: str) -> str:
@@ -365,6 +366,33 @@ class TranscriptParser:
         body = rest.replace(start, "").replace(end, "").strip("\n")
         inner = f"{head}\n{body}" if body else head
         return f"{start}{cls._TOOL_FOLD_PAD}{inner}{end}"
+
+    @classmethod
+    def fold_tool_batch(cls, messages: list[str], body_chars: int) -> str:
+        """Several tool messages (_fold_tool_message) as one collapsed quote.
+
+        Its first line has a dot per call (".." for two) in place of the first
+        padding line, so the collapsed preview tells how many calls it holds.
+        Below the padding: the calls' summary lines, numbered, then each
+        call's output and input, cut to body_chars.
+        """
+        start, end = cls.EXPANDABLE_QUOTE_START, cls.EXPANDABLE_QUOTE_END
+        heads: list[str] = []
+        bodies: list[str] = []
+        for message in messages:
+            inner = message.replace(start, "").replace(end, "")
+            head, _, body = inner.removeprefix(cls._TOOL_FOLD_PAD).partition("\n")
+            heads.append(head)
+            bodies.append(body.strip("\n"))
+        lines = [f"{i}. {head}" for i, head in enumerate(heads, 1)]
+        for i, body in enumerate(bodies, 1):
+            if len(body) > body_chars:
+                body = body[:body_chars].rstrip() + "…"
+            if body:
+                lines.append(f"\n── {i} ──\n{body}")
+        dots = "." * len(messages)
+        pad = cls._TOOL_FOLD_PAD_LINE * 2
+        return f"{start}{dots}\n{pad}" + "\n".join(lines) + end
 
     @classmethod
     def _inline_stats(cls, text: str) -> str:

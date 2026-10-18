@@ -738,3 +738,23 @@ class TestParseEntries:
         result, _pending = TranscriptParser.parse_entries(entries)
         user_entries = [e for e in result if e.role == "user"]
         assert len(user_entries) == 0
+
+
+def test_tool_batch_shows_a_dot_per_call_then_numbered_summaries():
+    calls = [
+        TranscriptParser._fold_tool_message(
+            f"**Bash**(cmd {i}) -- Output 2 lines\n{body}"
+        )
+        for i, body in ((1, "short"), (2, "x" * 50))
+    ]
+    text = TranscriptParser.fold_tool_batch(calls, body_chars=20)
+    start, end = (
+        TranscriptParser.EXPANDABLE_QUOTE_START,
+        TranscriptParser.EXPANDABLE_QUOTE_END,
+    )
+    assert text.startswith(f"{start}..\n\u2800\n\u2800\n1. Bash(cmd 1)")
+    assert text.endswith(end)
+    inner = text.removeprefix(start).removesuffix(end)
+    assert "2. Bash(cmd 2) -- Output 2 lines" in inner
+    assert "── 1 ──\nshort" in inner
+    assert "── 2 ──\n" + "x" * 20 + "…" in inner
