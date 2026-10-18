@@ -673,14 +673,18 @@ class TestSubagents:
             **extra,
         }
 
-    def _write_agent(self, tmp_path, agent_id: str, entries: list[dict]) -> None:
+    def _write_agent(
+        self, tmp_path, agent_id: str, entries: list[dict], meta: dict | None = None
+    ) -> None:
         agent_dir = tmp_path / "s" / "subagents"
         agent_dir.mkdir(parents=True, exist_ok=True)
         (agent_dir / f"agent-{agent_id}.jsonl").write_text(
             "".join(json.dumps(e) + "\n" for e in entries)
         )
         (agent_dir / f"agent-{agent_id}.meta.json").write_text(
-            json.dumps({"agentType": "general-purpose", "description": "Watch job 7"})
+            json.dumps(
+                meta or {"agentType": "general-purpose", "description": "Watch job 7"}
+            )
         )
 
     async def test_a_new_subagent_is_read_from_its_first_line(self, monitor, tmp_path):
@@ -745,6 +749,55 @@ class TestSubagents:
         tracked = monitor.state.get_session("agent-a1")
         assert tracked is not None and tracked.parent_session_id == "s"
         assert await monitor.check_for_updates({"s"}) == []
+
+    async def test_a_fork_skips_the_history_it_inherited(self, monitor, tmp_path):
+        history = [
+            self._entry("user", "Research routers.", parentUuid=None, uuid="u1"),
+            self._entry(
+                "assistant",
+                [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+                uuid="u2",
+            ),
+            self._entry(
+                "user",
+                [{"type": "tool_result", "tool_use_id": "t1", "content": "R"}],
+                uuid="u3",
+            ),
+        ]
+        self._write_agent(tmp_path, "parent", history)
+        assert len(await monitor.check_for_updates({"s"})) == 3
+
+        directive = (
+            "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\n\n"
+            "Your directive: the SMG part only."
+        )
+        self._write_agent(
+            tmp_path,
+            "fork",
+            [
+                *history,  # copied under the original UUIDs
+                self._entry("user", directive, uuid="f1"),
+                self._entry(
+                    "assistant",
+                    [{"type": "text", "text": "SMG done."}],
+                    uuid="f2",
+                    stop_reason="end_turn",
+                ),
+            ],
+            meta={
+                "agentType": "fork",
+                "isFork": True,
+                "description": "SMG router research",
+                "parentAgentId": "parent",
+            },
+        )
+        messages = await monitor.check_for_updates({"s"})
+
+        assert [m.agent_id for m in messages] == ["fork", "fork"]
+        assert messages[0].text.startswith("📋 Task\n")
+        assert "Your directive: the SMG part only." in messages[0].text
+        assert "boilerplate" not in messages[0].text
+        assert messages[1].text == "SMG done."
 
     async def test_an_older_subagent_shows_what_it_writes_after_a_follow_up(
         self, monitor, tmp_path

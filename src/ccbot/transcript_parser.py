@@ -21,6 +21,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# What Claude Code puts in front of a fork subagent's directive
+_RE_FORK_BOILERPLATE = re.compile(
+    r"<fork-boilerplate>.*?</fork-boilerplate>\s*", re.DOTALL
+)
+
 
 @dataclass
 class ParsedMessage:
@@ -221,7 +226,10 @@ class TranscriptParser:
 
         Its task (its transcript's first message) and later messages from the
         session that started it are not the user's words, so they get no 👤.
+        A fork's task loses the boilerplate Claude Code wraps it in.
         """
+        if is_task:
+            text = _RE_FORK_BOILERPLATE.sub("", text)
         head = "📋 Task" if is_task else "📨 Message from the main session"
         return f"{head}\n{cls._format_expandable_quote(text)}"
 

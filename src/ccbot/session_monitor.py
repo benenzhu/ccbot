@@ -22,7 +22,8 @@ session is read from its first line; an older one from where it is, so it
 shows up again once it writes more (a follow-up from the main session is
 appended to the same transcript). Its messages carry agent_id (the bot sends
 them to the subagent's own topic). Its task and messages from the main
-session become notifications, not 👤 echoes.
+session become notifications, not 👤 echoes. A fork subagent (meta.json
+isFork) begins with a copy of its parent's transcript; that copy is skipped.
 
 Optimizations: mtime cache skips unchanged files; byte offset avoids re-reading.
 
@@ -52,6 +53,9 @@ logger = logging.getLogger(__name__)
 # A session's subagent transcripts: <session>/subagents/agent-<id>.jsonl
 SUBAGENTS_DIR = "subagents"
 AGENT_KEY_PREFIX = "agent-"  # also the tracked-session key: "agent-<id>"
+# Seconds a new subagent waits for its meta.json (which says whether it is a
+# fork) before it is read as an ordinary subagent
+AGENT_META_WAIT = 10.0
 
 # Compact replay: content types dropped, and the line that marks where they were
 REPLAY_DROPPED_TYPES = frozenset(
@@ -142,13 +146,18 @@ class SessionMonitor:
         # Forks copy messages with their original UUIDs but rewrite the JSONL,
         # so a source byte offset cannot be used to skip inherited history.
         self._fork_history_uuids: dict[str, set[str]] = {}
+        # Fork subagents whose next 👤-less user message is their task
+        self._fork_task_pending: set[str] = set()
         # Each subagent's task description: agent key -> description
         self._agent_descriptions: dict[str, str] = {}
+        # New subagents waiting for their meta.json: agent key -> first seen
+        self._agent_first_seen: dict[str, float] = {}
 
-    async def skip_fork_history(self, session_id: str, source_path: str) -> None:
-        """Remember inherited message UUIDs before starting a fork without replay."""
+    @staticmethod
+    async def _read_uuids(path: str | Path) -> set[str]:
+        """The message UUIDs in a transcript."""
         uuids: set[str] = set()
-        async with aiofiles.open(source_path, "r", encoding="utf-8") as f:
+        async with aiofiles.open(path, "r", encoding="utf-8") as f:
             async for line in f:
                 try:
                     entry = json.loads(line)
@@ -156,7 +165,27 @@ class SessionMonitor:
                     continue
                 if isinstance(entry, dict) and isinstance(entry.get("uuid"), str):
                     uuids.add(entry["uuid"])
-        self._fork_history_uuids[session_id] = uuids
+        return uuids
+
+    async def skip_fork_history(self, session_id: str, source_path: str) -> None:
+        """Remember inherited message UUIDs before starting a fork without replay."""
+        self._fork_history_uuids[session_id] = await self._read_uuids(source_path)
+
+    def _drop_inherited(
+        self, key: str, lines: list[tuple[int, dict]]
+    ) -> list[tuple[int, dict]]:
+        """Drop the history a fork copied from its source (_fork_history_uuids)."""
+        inherited = self._fork_history_uuids.get(key)
+        if inherited is None:
+            return lines
+        lines = [(offset, e) for offset, e in lines if e.get("uuid") not in inherited]
+        # Keep the filter across partial writes of the copied transcript,
+        # until the first new conversation message.
+        if any(
+            e.get("type") in ("user", "assistant") and e.get("uuid") for _, e in lines
+        ):
+            self._fork_history_uuids.pop(key, None)
+        return lines
 
     def mark_replay(self, session_id: str) -> None:
         """Flag a tracked session as replaying history.
@@ -473,20 +502,7 @@ class SessionMonitor:
                 read_at = time.time()
                 self._file_mtimes[session_info.session_id] = current_mtime
 
-                inherited = self._fork_history_uuids.get(session_info.session_id)
-                if inherited is not None:
-                    new_lines = [
-                        (offset, entry)
-                        for offset, entry in new_lines
-                        if entry.get("uuid") not in inherited
-                    ]
-                    # Keep the filter across partial writes of the copied
-                    # transcript, until the first new conversation message.
-                    if any(
-                        entry.get("type") in ("user", "assistant") and entry.get("uuid")
-                        for _, entry in new_lines
-                    ):
-                        self._fork_history_uuids.pop(session_info.session_id, None)
+                new_lines = self._drop_inherited(session_info.session_id, new_lines)
 
                 line_offsets = [offset for offset, _ in new_lines]
                 new_entries = [entry for _, entry in new_lines]
@@ -599,37 +615,87 @@ class SessionMonitor:
         return new_messages
 
     @staticmethod
-    def _first_timestamp(path: Path) -> float | None:
-        """When a transcript began (epoch seconds); None if not written yet."""
+    def _first_timestamp(path: Path, skip: set[str] | None = None) -> float | None:
+        """When a transcript began (epoch seconds); None if not written yet.
+
+        Entries whose uuid is in skip (the history a fork inherited) don't count.
+        """
         try:
             with path.open("rb") as f:
-                for _ in range(5):  # a fork's first line has no timestamp
+                looked = 0
+                while looked < 5:  # a fork's first line has no timestamp
                     line = f.readline()
                     if not line.endswith(b"\n"):
                         return None
                     try:
-                        stamp = json.loads(line).get("timestamp")
-                        if isinstance(stamp, str):
-                            return datetime.fromisoformat(stamp).timestamp()
-                    except (ValueError, AttributeError):
+                        entry = json.loads(line)
+                    except ValueError:
+                        entry = None
+                    if not isinstance(entry, dict):
+                        entry = {}
+                    elif skip and entry.get("uuid") in skip:
                         continue
+                    looked += 1
+                    stamp = entry.get("timestamp")
+                    if isinstance(stamp, str):
+                        try:
+                            return datetime.fromisoformat(stamp).timestamp()
+                        except ValueError:
+                            continue
         except OSError:
             pass
         return None
+
+    @staticmethod
+    def _agent_meta(path: Path) -> dict[str, Any] | None:
+        """A subagent's agent-<id>.meta.json; None if not written yet."""
+        try:
+            meta = json.loads(path.with_suffix(".meta.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return meta if isinstance(meta, dict) else {}
 
     def _agent_description(self, path: Path) -> str:
         """The task Claude gave the subagent (agent-<id>.meta.json)."""
         key = path.stem
         if key not in self._agent_descriptions:
-            try:
-                meta = json.loads(path.with_suffix(".meta.json").read_text())
-                description = meta.get("description") if isinstance(meta, dict) else ""
-            except (OSError, ValueError):
+            meta = self._agent_meta(path)
+            if meta is None:
                 return ""  # not written yet: ask again next time
+            description = meta.get("description")
             self._agent_descriptions[key] = (
                 description.strip() if isinstance(description, str) else ""
             )
         return self._agent_descriptions[key]
+
+    async def _fork_inherited(self, path: Path, parent_file: Path) -> set[str] | None:
+        """UUIDs of the history a fork subagent inherited; empty for others.
+
+        A fork's transcript begins with a copy of its parent's (the subagent
+        in meta.json parentAgentId, else the session) under the original
+        UUIDs. None while meta.json, which says whether it is a fork, is not
+        written yet (for AGENT_META_WAIT at most).
+        """
+        key = path.stem
+        meta = self._agent_meta(path)
+        if meta is None:
+            first_seen = self._agent_first_seen.setdefault(key, time.monotonic())
+            if time.monotonic() - first_seen < AGENT_META_WAIT:
+                return None
+            meta = {}
+        self._agent_first_seen.pop(key, None)
+        if not meta.get("isFork"):
+            return set()
+        parent_agent = meta.get("parentAgentId")
+        source = (
+            path.with_name(f"{AGENT_KEY_PREFIX}{parent_agent}.jsonl")
+            if isinstance(parent_agent, str) and parent_agent
+            else parent_file
+        )
+        try:
+            return await self._read_uuids(source)
+        except OSError:
+            return set()
 
     @staticmethod
     def _agent_entry_shown(entry: dict[str, Any]) -> bool:
@@ -657,9 +723,16 @@ class SessionMonitor:
             key = path.stem  # agent-<id>
             tracked = self.state.get_session(key)
             if tracked is None:
-                started = self._first_timestamp(path)
+                inherited = self._fork_history_uuids.get(key)
+                if inherited is None:
+                    inherited = await self._fork_inherited(path, parent_file)
+                    if inherited is None:
+                        continue  # its meta.json is not written yet
+                    if inherited:
+                        self._fork_history_uuids[key] = inherited
+                started = self._first_timestamp(path, skip=inherited)
                 if started is None:
-                    continue  # nothing written yet
+                    continue  # nothing (of its own) written yet
                 tracked = TrackedSession(
                     session_id=key,
                     file_path=str(path),
@@ -674,7 +747,10 @@ class SessionMonitor:
                         continue
                     tracked.last_byte_offset = st.st_size
                     self._file_mtimes[key] = st.st_mtime
+                    self._fork_history_uuids.pop(key, None)
                 else:
+                    if inherited:
+                        self._fork_task_pending.add(key)
                     logger.info(
                         "Started tracking subagent %s of session %s",
                         key,
@@ -699,9 +775,10 @@ class SessionMonitor:
         ):
             return []
         previous_offset = tracked.last_byte_offset
+        new_lines = await self._read_new_lines_with_offsets(tracked, path)
         lines = [
             (offset, entry)
-            for offset, entry in await self._read_new_lines_with_offsets(tracked, path)
+            for offset, entry in self._drop_inherited(key, new_lines)
             if self._agent_entry_shown(entry)
         ]
         read_at = time.time()
@@ -729,11 +806,14 @@ class SessionMonitor:
                 line_offset, source = previous_offset, {}
             text, content_type, role = entry.text, entry.content_type, entry.role
             if role == "user":
-                # Its task (the first message) or a message from the main
-                # session: not the user's words
-                text = TranscriptParser.format_subagent_input(
-                    text, is_task=source.get("parentUuid") is None
+                # Its task (the first message, or a fork's first after the
+                # history it inherited) or a message from the main session:
+                # not the user's words
+                is_task = (
+                    source.get("parentUuid") is None or key in self._fork_task_pending
                 )
+                self._fork_task_pending.discard(key)
+                text = TranscriptParser.format_subagent_input(text, is_task=is_task)
                 content_type, role = "notification", "assistant"
             message = source.get("message")
             finished = (
@@ -816,6 +896,7 @@ class SessionMonitor:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
                 self._fork_history_uuids.pop(session_id, None)
+                self._fork_task_pending.discard(session_id)
                 self._pending_tools.pop(session_id, None)
         self.state.save_if_dirty()
 
