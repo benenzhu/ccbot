@@ -5,6 +5,7 @@ import pytest
 from ccbot.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
+    is_input_ready,
     is_interactive_ui,
     parse_status_line,
     strip_pane_chrome,
@@ -222,6 +223,33 @@ class TestIsInteractiveUI:
 
     def test_false_for_empty_string(self):
         assert is_interactive_ui("") is False
+
+
+# ── is_input_ready ──────────────────────────────────────────────────────
+
+
+class TestIsInputReady:
+    def test_input_box_with_blank_lines_below(self, chrome: str):
+        """A fresh session draws at the top of a tall pane."""
+        assert is_input_ready(f"✻ Welcome\n\n{chrome}" + "\n" * 30)
+
+    def test_named_input_box_with_typed_text(self):
+        rule = "─" * 40
+        assert is_input_ready(f"● Done.\n{rule} fork-a ─\n❯ draft\n{rule}\n  bar\n")
+
+    @pytest.mark.parametrize(
+        "pane",
+        [
+            pytest.param("$ claude --resume abc --fork-session\n", id="loading"),
+            pytest.param("", id="empty"),
+            pytest.param(
+                "─" * 40 + "\n Resume from summary?\n❯ 1. Yes\n  2. No\n",
+                id="dialog",
+            ),
+        ],
+    )
+    def test_no_input_box(self, pane: str):
+        assert not is_input_ready(pane)
 
 
 # ── strip_pane_chrome ───────────────────────────────────────────────────

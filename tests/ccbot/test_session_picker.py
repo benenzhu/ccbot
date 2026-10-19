@@ -365,3 +365,54 @@ async def test_fork_skips_rewritten_history_across_polls(tmp_path, monkeypatch):
     assert not messages[0].is_replay
     assert "fork" not in monitor._fork_history_uuids
     assert await monitor.check_for_updates({"fork"}) == []
+
+
+async def test_fork_skips_what_its_source_wrote_while_claude_started(
+    tmp_path, monkeypatch
+):
+    """Claude copies the source only once started; the source wrote on meanwhile.
+
+    The copy carries the source's name too, which Claude re-appends after the
+    fork's own first entries: no rename, until the fork's own /rename.
+    """
+    monitor = SessionMonitor(state_file=tmp_path / "monitor.json")
+    source = tmp_path / "source.jsonl"
+    title = {"type": "custom-title", "customTitle": "dsv41", "sessionId": "source"}
+
+    def answer(uuid: str, text: str, session: str = "source") -> dict:
+        return {
+            "uuid": uuid,
+            "sessionId": session,
+            "type": "assistant",
+            "message": {"content": text},
+        }
+
+    write_entries(source, [title, answer("old", "old")])
+    await monitor.skip_fork_history("fork", str(source))
+    write_entries(source, [title, answer("old", "old"), answer("late", "late")])
+    target = tmp_path / "fork.jsonl"
+    monitor.state.update_session(
+        TrackedSession("fork", str(target), last_byte_offset=0)
+    )
+    monkeypatch.setattr(
+        monitor, "scan_projects", AsyncMock(return_value=[SessionInfo("fork", target)])
+    )
+    fork_title = dict(title, sessionId="fork")
+    write_entries(
+        target,
+        [
+            fork_title,
+            answer("old", "old", "fork"),
+            answer("late", "late", "fork"),
+            answer("new", "first new answer", "fork"),
+            fork_title,
+        ],
+    )
+    messages = await monitor.check_for_updates({"fork"})
+    assert [m.text for m in messages] == ["first new answer"]
+    assert monitor.take_renames() == []
+
+    with target.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(dict(fork_title, customTitle="fork-a")) + "\n")
+    assert await monitor.check_for_updates({"fork"}) == []
+    assert monitor.take_renames() == [("fork", "fork-a")]

@@ -10,6 +10,7 @@ Delivery is at-least-once: every NewMessage carries a DeliveryTicket that pins
 the persisted offset at its JSONL line until the message has been sent.
 Session names: Claude's /rename writes a custom-title line; a title that
 changed is handed to the rename callback (which renames window and topic).
+A /fork starts out with its source's name, which renames nothing.
 
 History replays are compacted (config.replay_compact): thinking and tool
 messages are dropped, each run of them marked by a divider line at the top of
@@ -146,6 +147,8 @@ class SessionMonitor:
         # Forks copy messages with their original UUIDs but rewrite the JSONL,
         # so a source byte offset cannot be used to skip inherited history.
         self._fork_history_uuids: dict[str, set[str]] = {}
+        # Each /fork's source transcript, re-read once the fork's shows up
+        self._fork_sources: dict[str, str] = {}
         # Fork subagents whose next 👤-less user message is their task
         self._fork_task_pending: set[str] = set()
         # Each subagent's task description: agent key -> description
@@ -154,22 +157,73 @@ class SessionMonitor:
         self._agent_first_seen: dict[str, float] = {}
 
     @staticmethod
-    async def _read_uuids(path: str | Path) -> set[str]:
-        """The message UUIDs in a transcript."""
+    def _title_of(entry: dict[str, Any]) -> str | None:
+        """The session name (/rename) a custom-title line sets, if it is one."""
+        title = entry.get("customTitle")
+        if entry.get("type") != "custom-title" or not isinstance(title, str):
+            return None
+        return title.strip() or None
+
+    @classmethod
+    async def _read_history(cls, path: str | Path) -> tuple[set[str], str | None]:
+        """The message UUIDs in a transcript, and its last session name."""
         uuids: set[str] = set()
+        name = None
         async with aiofiles.open(path, "r", encoding="utf-8") as f:
             async for line in f:
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(entry, dict) and isinstance(entry.get("uuid"), str):
+                if not isinstance(entry, dict):
+                    continue
+                if isinstance(entry.get("uuid"), str):
                     uuids.add(entry["uuid"])
+                name = cls._title_of(entry) or name
+        return uuids, name
+
+    @classmethod
+    async def _read_uuids(cls, path: str | Path) -> set[str]:
+        """The message UUIDs in a transcript."""
+        uuids, _ = await cls._read_history(path)
         return uuids
 
     async def skip_fork_history(self, session_id: str, source_path: str) -> None:
-        """Remember inherited message UUIDs before starting a fork without replay."""
-        self._fork_history_uuids[session_id] = await self._read_uuids(source_path)
+        """Remember inherited message UUIDs before starting a fork without replay.
+
+        The fork also inherits its source's name, which Claude keeps writing
+        into the fork's transcript until /rename: it is noted as the fork's
+        title, so it renames nothing.
+        """
+        uuids, name = await self._read_history(source_path)
+        self._fork_history_uuids[session_id] = uuids
+        self._fork_sources[session_id] = source_path
+        if name:
+            self._titles[session_id] = name
+
+    async def _refresh_fork_history(self, session_id: str) -> None:
+        """Add what a fork's source wrote after skip_fork_history.
+
+        Claude copies the source only once it has started (half a minute after
+        the launch, on a long session), and the source keeps writing meanwhile.
+        """
+        source = self._fork_sources.get(session_id)
+        inherited = self._fork_history_uuids.get(session_id)
+        if source is None or inherited is None:
+            return
+        try:
+            uuids, name = await self._read_history(source)
+        except OSError as e:
+            logger.warning("Fork %s: cannot re-read %s: %s", session_id, source, e)
+            return
+        inherited |= uuids
+        if name:
+            self._titles[session_id] = name
+
+    def forget_fork_history(self, key: str) -> None:
+        """Stop filtering a fork's inherited history."""
+        self._fork_history_uuids.pop(key, None)
+        self._fork_sources.pop(key, None)
 
     def _drop_inherited(
         self, key: str, lines: list[tuple[int, dict]]
@@ -184,7 +238,7 @@ class SessionMonitor:
         if any(
             e.get("type") in ("user", "assistant") and e.get("uuid") for _, e in lines
         ):
-            self._fork_history_uuids.pop(key, None)
+            self.forget_fork_history(key)
         return lines
 
     def mark_replay(self, session_id: str) -> None:
@@ -217,17 +271,13 @@ class SessionMonitor:
 
         Claude Code re-appends the current title line every so often, so only a
         title different from the last one seen counts. Forks carry the source
-        session's title lines, which name that session, not this one.
+        session's title lines, which name that session, not this one (older
+        Claude Code kept their sessionId; see also skip_fork_history).
         """
         title = None
         for entry in entries:
-            if (
-                entry.get("type") == "custom-title"
-                and entry.get("sessionId", session_id) == session_id
-                and isinstance(entry.get("customTitle"), str)
-                and entry["customTitle"].strip()
-            ):
-                title = entry["customTitle"].strip()
+            if entry.get("sessionId", session_id) == session_id:
+                title = self._title_of(entry) or title
         if title and self._titles.get(session_id) != title:
             self._titles[session_id] = title
             self._renames.append((session_id, title))
@@ -502,6 +552,7 @@ class SessionMonitor:
                 read_at = time.time()
                 self._file_mtimes[session_info.session_id] = current_mtime
 
+                await self._refresh_fork_history(session_info.session_id)
                 new_lines = self._drop_inherited(session_info.session_id, new_lines)
 
                 line_offsets = [offset for offset, _ in new_lines]
@@ -895,7 +946,7 @@ class SessionMonitor:
             if session_id in session_ids or tracked.parent_session_id in session_ids:
                 self.state.remove_session(session_id)
                 self._file_mtimes.pop(session_id, None)
-                self._fork_history_uuids.pop(session_id, None)
+                self.forget_fork_history(session_id)
                 self._fork_task_pending.discard(session_id)
                 self._pending_tools.pop(session_id, None)
         self.state.save_if_dirty()

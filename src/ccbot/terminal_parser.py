@@ -5,12 +5,13 @@ Parses captured tmux pane content to detect:
     RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
     delimiters.
   - Status line (spinner characters + working text) by scanning from bottom up.
+  - Whether the input box is up, i.e. Claude takes typed keys (is_input_ready).
 
 All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
 Key functions: is_interactive_ui(), extract_interactive_content(),
-parse_status_line(), strip_pane_chrome(), extract_bash_output().
+parse_status_line(), is_input_ready(), strip_pane_chrome(), extract_bash_output().
 """
 
 import re
@@ -214,6 +215,22 @@ def _find_chrome_separator(lines: list[str]) -> int | None:
         if _RE_CHROME_SEPARATOR.match(lines[i].strip()):
             return i
     return None
+
+
+INPUT_SEARCH_LINES = 12
+
+
+def is_input_ready(pane_text: str) -> bool:
+    """Claude Code's input box is on screen: ``❯`` between chrome separators.
+
+    Claude draws it once it reads keys; before that (a long session still
+    loading on --resume), keys typed into the pane don't reliably arrive.
+    """
+    lines = pane_text.rstrip().split("\n")[-INPUT_SEARCH_LINES:]
+    for i, line in enumerate(lines[:-1]):
+        if _RE_CHROME_SEPARATOR.match(line.strip()) and lines[i + 1].startswith("❯"):
+            return any(_RE_CHROME_SEPARATOR.match(s.strip()) for s in lines[i + 2 :])
+    return False
 
 
 def parse_status_line(pane_text: str) -> str | None:

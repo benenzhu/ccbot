@@ -162,7 +162,7 @@ from .rate_limit import TelegramRateLimiter
 from .screenshot import text_to_image
 from .session import DeadBinding, session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import extract_bash_output, is_input_ready, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -667,6 +667,58 @@ FORK_TASK_PROMPT = (
 )
 # Pause between /rename and the task typed after it, so /rename has run
 FORK_RENAME_SETTLE_SECONDS = 1.0
+# How long a fork's Claude may take to show its input box: resuming a long
+# session took 31s
+CLAUDE_READY_TIMEOUT = 120.0
+# Forks still waiting for their Claude to name them and hand over the task
+_fork_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _wait_for_input(
+    window_id: str, timeout: float = CLAUDE_READY_TIMEOUT
+) -> bool:
+    """Wait until Claude Code in the window shows its input box."""
+    deadline = time.monotonic() + timeout
+    while True:
+        pane = await tmux_manager.capture_pane(window_id)
+        if pane and is_input_ready(pane):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(1.0)
+
+
+async def _finish_fork(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int,
+    window_id: str,
+    session_id: str | None,
+    name: str,
+    task: str,
+) -> None:
+    """Name the fork and hand it its task, once its Claude takes keys."""
+    await _await_session_start(window_id, session_id, resumed=True)
+    if not await _wait_for_input(window_id):
+        logger.warning(
+            "Fork %s: no input box after %.0fs", window_id, CLAUDE_READY_TIMEOUT
+        )
+        unsent = f"/rename {name}" + (" and the task" if task else "")
+        await safe_send(
+            bot,
+            chat_id,
+            f"❌ Claude did not get ready within {CLAUDE_READY_TIMEOUT:.0f}s: "
+            f"{unsent} not sent. Send it here once Claude is up.",
+            message_thread_id=thread_id,
+        )
+        return
+    # Claude's name is the one window and topic follow (handle_session_renamed)
+    await session_manager.send_to_window(window_id, f"/rename {name}")
+    if task:
+        await asyncio.sleep(FORK_RENAME_SETTLE_SECONDS)
+        await session_manager.send_to_window(
+            window_id, FORK_TASK_PROMPT.format(task=task)
+        )
 
 
 def _parse_fork_command(text: str) -> tuple[str, str]:
@@ -684,7 +736,8 @@ async def fork_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     whole conversation so far, as a new session) bound to a new topic. Topic,
     window and Claude session are all named <name>. A task on the following
     lines is sent prefixed with FORK_TASK_PROMPT; the original window carries
-    on with its own work.
+    on with its own work. /rename and the task wait for Claude's input box
+    (_finish_fork, in the background).
     """
     user = update.effective_user
     if not user or not is_user_allowed(user.id) or not update.message:
@@ -762,14 +815,13 @@ async def fork_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         message_thread_id=new_thread,
     )
 
-    await _await_session_start(new_wid, fork_sid, resumed=True)
-    # Claude's name is the one window and topic follow (handle_session_renamed)
-    await session_manager.send_to_window(new_wid, f"/rename {name}")
-    if task:
-        await asyncio.sleep(FORK_RENAME_SETTLE_SECONDS)
-        await session_manager.send_to_window(
-            new_wid, FORK_TASK_PROMPT.format(task=task)
-        )
+    # In the background: updates are handled one at a time, and Claude can
+    # take a minute to start
+    fork_task = asyncio.create_task(
+        _finish_fork(context.bot, chat_id, new_thread, new_wid, fork_sid, name, task)
+    )
+    _fork_tasks.add(fork_task)
+    fork_task.add_done_callback(_fork_tasks.discard)
 
 
 async def forward_command_handler(
@@ -1373,7 +1425,7 @@ async def _launch_session_window(
         if fork_session_id and session_monitor is not None:
             session_monitor.state.remove_session(fork_session_id)
             session_monitor.state.save()
-            session_monitor._fork_history_uuids.pop(fork_session_id, None)
+            session_monitor.forget_fork_history(fork_session_id)
         return False, message, "", "", None
 
     # On resume, wire up routing (window_state.session_id + thread binding)
